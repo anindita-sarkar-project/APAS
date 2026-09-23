@@ -252,11 +252,35 @@ tsch_queue_add_packet(const linkaddr_t *addr, uint8_t max_transmissions,
           /* Enqueue packet */
           p->qb = queuebuf_new_from_packetbuf();
           if(p->qb != NULL) {
+            if(queuebuf_attr(p->qb, PACKETBUF_ATTR_TSCH_SLOTFRAME) >= 0x2000) {
+              LOG_INFO("IATRACE enqueued p=%p put_index=%d sf_tag=%u dst=",
+                       (void *)p, put_index, queuebuf_attr(p->qb, PACKETBUF_ATTR_TSCH_SLOTFRAME));
+              LOG_INFO_LLADDR(addr);
+              LOG_INFO_("\n");
+            }
             p->sent = sent;
             p->ptr = ptr;
             p->ret = MAC_TX_DEFERRED;
             p->transmissions = 0;
             p->max_transmissions = max_transmissions;
+#if TSCH_WITH_IMPLICIT_ACK
+            /* memb_alloc() does not zero the block: without this, a freshly
+             * allocated packet can inherit a stale ia_pending=1 left over by
+             * whatever packet previously occupied this same pool slot. That
+             * makes tsch_queue_get_packet_for_nbr()'s scan treat this
+             * never-yet-transmitted packet as "already sent, awaiting
+             * confirmation" and skip it indefinitely -- confirmed in testing
+             * via a node stuck at 0% delivery for the last ~90% of a 49-node
+             * run, with an "IATRACE timeout" firing on a packet showing
+             * transmissions=0 (i.e. it was declared NOACK by the stale-
+             * deadline sweep without ever having been radio-transmitted).
+             * This got dramatically worse once confirmation deadlines could
+             * exceed 1 cycle (the congestion-driven adaptive deadline),
+             * since a stale-but-plausible leftover deadline then survives
+             * long enough to matter, and reallocation happens most often on
+             * exactly the busy, high-churn neighbors this bug hits hardest. */
+            p->ia_pending = 0;
+#endif /* TSCH_WITH_IMPLICIT_ACK */
             /* Add to ringbuf (actual add committed through atomic operation) */
             n->tx_array[put_index] = p;
             ringbufindex_put(&n->tx_ringbuf);
@@ -429,8 +453,76 @@ tsch_queue_get_packet_for_nbr(const struct tsch_neighbor *n, struct tsch_link *l
     if(n != NULL) {
       int16_t get_index = ringbufindex_peek_get(&n->tx_ringbuf);
       if(get_index != -1 &&
-          !(is_shared_link && !tsch_queue_backoff_expired(n))) {    /* If this is a shared link,
+          !(is_shared_link && !tsch_queue_backoff_expired(n))    /* If this is a shared link,
                                                                     make sure the backoff has expired */
+          ) {
+#if TSCH_WITH_IMPLICIT_ACK
+        /* Scan forward from the head for the first packet matching this
+         * cell's tag (promoting it to the head on a match), rather than
+         * only ever considering the literal head position. Once a single
+         * neighbor's queue can carry more than one Tx role sharing one
+         * physical ring buffer (our own UPLINK data interleaved with a
+         * child's relayed RELAY_TX traffic, or an implicit-ack packet stuck
+         * ia_pending at the head), checking only the head means a single
+         * struggling packet from ONE role permanently blocks every other
+         * role's cell from ever dequeuing anything behind it -- confirmed
+         * in testing via per-slot logs showing a RELAY_TX cell finding the
+         * exact same stuck (different-tag) head packet, unchanged, across
+         * dozens of its own occurrences spanning tens of seconds, while the
+         * actual relayed packet sat fully ready to send only a few slots
+         * behind it the entire time. Promoting only ever reorders across
+         * DIFFERENT tags: packets sharing the same tag keep their original
+         * relative order, since the scan always finds (and promotes)
+         * whichever matching packet is nearest the existing head. */
+        {
+          int n_elems = ringbufindex_elements(&n->tx_ringbuf);
+          int size = ringbufindex_size(&n->tx_ringbuf);
+          int i;
+          for(i = 0; i < n_elems; i++) {
+            int idx = (get_index + i) & (size - 1);
+            struct tsch_packet *candidate = n->tx_array[idx];
+            if(candidate->ia_pending) {
+              /* Not eligible regardless of tag match: already sent,
+               * awaiting implicit confirmation or timeout. */
+              continue;
+            }
+#if TSCH_WITH_LINK_SELECTOR
+            {
+              int packet_attr_slotframe = queuebuf_attr(candidate->qb, PACKETBUF_ATTR_TSCH_SLOTFRAME);
+              int packet_attr_timeslot = queuebuf_attr(candidate->qb, PACKETBUF_ATTR_TSCH_TIMESLOT);
+              if(packet_attr_slotframe != 0xffff && packet_attr_slotframe != link->slotframe_handle) {
+                continue;
+              }
+              if(packet_attr_timeslot != 0xffff && packet_attr_timeslot != link->timeslot) {
+                continue;
+              }
+            }
+#endif /* TSCH_WITH_LINK_SELECTOR */
+            if(i != 0) {
+              /* Promote: shift the skipped entries [get_index, idx) right by
+               * one slot, then place candidate at get_index. This only
+               * permutes already-occupied slots -- ringbufindex's own
+               * get_ptr/put_ptr (and therefore full/empty/elements) are
+               * untouched -- so it's safe to do without any extra locking
+               * beyond the tsch_is_locked() check already in effect above.
+               * tx_array is mutated in place here, hence the const-cast:
+               * this function's `n` parameter is const in every other
+               * (read-only) path, but this specific reordering is an
+               * intentional, in-place update of the very array `n` owns. */
+              struct tsch_neighbor *mutable_n = (struct tsch_neighbor *)n;
+              int j;
+              for(j = i; j > 0; j--) {
+                int dst = (get_index + j) & (size - 1);
+                int src = (get_index + j - 1) & (size - 1);
+                mutable_n->tx_array[dst] = mutable_n->tx_array[src];
+              }
+              mutable_n->tx_array[get_index] = candidate;
+            }
+            return candidate;
+          }
+        }
+        return NULL;
+#else /* TSCH_WITH_IMPLICIT_ACK */
 #if TSCH_WITH_LINK_SELECTOR
         int packet_attr_slotframe = queuebuf_attr(n->tx_array[get_index]->qb, PACKETBUF_ATTR_TSCH_SLOTFRAME);
         int packet_attr_timeslot = queuebuf_attr(n->tx_array[get_index]->qb, PACKETBUF_ATTR_TSCH_TIMESLOT);
@@ -440,13 +532,31 @@ tsch_queue_get_packet_for_nbr(const struct tsch_neighbor *n, struct tsch_link *l
         if(packet_attr_timeslot != 0xffff && packet_attr_timeslot != link->timeslot) {
           return NULL;
         }
-#endif
+#endif /* TSCH_WITH_LINK_SELECTOR */
         return n->tx_array[get_index];
+#endif /* TSCH_WITH_IMPLICIT_ACK */
       }
     }
   }
   return NULL;
 }
+/*---------------------------------------------------------------------------*/
+#if TSCH_WITH_IMPLICIT_ACK
+/* Returns the head packet of a neighbor's queue, regardless of link/backoff/
+ * ia_pending eligibility -- used to locate a packet awaiting implicit-ack
+ * confirmation (or timeout) by neighbor alone, not by a specific link. */
+struct tsch_packet *
+tsch_queue_get_head_packet(const struct tsch_neighbor *n)
+{
+  if(!tsch_is_locked() && n != NULL) {
+    int16_t get_index = ringbufindex_peek_get(&n->tx_ringbuf);
+    if(get_index != -1) {
+      return n->tx_array[get_index];
+    }
+  }
+  return NULL;
+}
+#endif /* TSCH_WITH_IMPLICIT_ACK */
 /*---------------------------------------------------------------------------*/
 /* Returns the head packet from a neighbor queue (from neighbor address) */
 struct tsch_packet *

@@ -43,6 +43,7 @@
 #include "lib/random.h"
 #include "lib/csprng.h"
 #include "net/linkaddr.h"
+#include <inttypes.h>
 #include "net/netstack.h"
 #include <string.h>
 

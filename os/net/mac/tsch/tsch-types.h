@@ -78,6 +78,14 @@ struct tsch_link {
   enum link_type link_type;
   /* Any other data for upper layers */
   void *data;
+  /* Per-link override of the global tsch_timing_us/tsch_timing timeslot
+   * timing arrays (see enum tsch_timeslot_timing_elements below), or NULL to
+   * use the global default -- see TSCH_LINK_TIMING_US/TSCH_LINK_TIMING in
+   * tsch.h. NULL for every link unless explicitly set (e.g. the implicit-ack
+   * short timeslot template, orchestra-rule-implicit-ack.c): zero behavior
+   * change for any deployment that never sets these. */
+  const uint16_t *timing_us;
+  const rtimer_clock_t *timing_ticks;
 };
 
 /** \brief 802.15.4e slotframe (contains links) */
@@ -103,6 +111,12 @@ struct tsch_packet {
   uint8_t ret; /* status -- MAC return code */
   uint8_t header_len; /* length of header and header IEs (needed for link-layer security) */
   uint8_t tsch_sync_ie_offset; /* Offset within the frame used for quick update of EB ASN and join priority */
+#if TSCH_WITH_IMPLICIT_ACK
+  uint8_t ia_pending; /* radio-level Tx done, no explicit ack requested: awaiting an
+                          overheard parent->grandparent relay as implicit confirmation */
+  struct tsch_asn_t ia_deadline_asn; /* give up and treat as MAC_TX_NOACK after this ASN */
+  struct tsch_link *ia_link; /* the link this packet went out on, for tsch_queue_packet_sent() */
+#endif /* TSCH_WITH_IMPLICIT_ACK */
 };
 
 /** \brief TSCH neighbor information */

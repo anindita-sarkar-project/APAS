@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(gcc --version)",
+      "Bash(make TARGET=native node)",
+      "Bash(make TARGET=cooja node.cooja)",
+      "Bash(make TARGET=cooja clean)"
+    ]
+  }
+}

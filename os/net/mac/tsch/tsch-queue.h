@@ -156,6 +156,16 @@ struct tsch_packet *tsch_queue_get_packet_for_nbr(const struct tsch_neighbor *n,
  * \return The next packet to be sent for to the given address on the given link, if any, else NULL
  */
 struct tsch_packet *tsch_queue_get_packet_for_dest_addr(const linkaddr_t *addr, struct tsch_link *link);
+#if TSCH_WITH_IMPLICIT_ACK
+/**
+ * \brief Returns the head packet of a neighbor's queue, ignoring link/backoff/
+ *        ia_pending eligibility. Used to find a packet awaiting implicit-ack
+ *        confirmation or timeout.
+ * \param n The neighbor queue
+ * \return The head packet, if any, else NULL
+ */
+struct tsch_packet *tsch_queue_get_head_packet(const struct tsch_neighbor *n);
+#endif /* TSCH_WITH_IMPLICIT_ACK */
 /**
  * \brief Gets the head packet of any neighbor queue with zero backoff counter.
  * \param n A pointer where to store the neighbor queue to be used for Tx

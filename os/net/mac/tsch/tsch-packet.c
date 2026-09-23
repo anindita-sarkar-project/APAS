@@ -270,6 +270,22 @@ tsch_packet_create_eb(uint8_t *hdr_len, uint8_t *tsch_sync_ie_offset)
   }
 #endif /* TSCH_PACKET_EB_WITH_SLOTFRAME_AND_LINK */
 
+  /* Add our own parent's address (our children's grandparent) IE, our own
+   * current congestion toward that parent (for our children to size their
+   * own implicit-ack confirmation deadline), and our own children's
+   * addresses (for our parent, their grandparent) IE */
+#if TSCH_WITH_IMPLICIT_ACK
+#ifdef TSCH_CALLBACK_IA_OWN_PARENT
+  ies.ie_ia_has_grandparent = TSCH_CALLBACK_IA_OWN_PARENT(&ies.ie_ia_grandparent, &ies.ie_ia_grandparent_is_root);
+#endif /* TSCH_CALLBACK_IA_OWN_PARENT */
+#ifdef TSCH_CALLBACK_IA_CONGESTION
+  ies.ie_ia_parent_congestion = TSCH_CALLBACK_IA_CONGESTION();
+#endif /* TSCH_CALLBACK_IA_CONGESTION */
+#ifdef TSCH_CALLBACK_IA_OWN_CHILDREN
+  ies.ie_ia_num_children = TSCH_CALLBACK_IA_OWN_CHILDREN(ies.ie_ia_children, ies.ie_ia_children_has_descendants, TSCH_IA_IE_MAX_CHILDREN);
+#endif /* TSCH_CALLBACK_IA_OWN_CHILDREN */
+#endif /* TSCH_WITH_IMPLICIT_ACK */
+
   p = packetbuf_dataptr();
 
   ie_len = frame80215e_create_ie_tsch_synchronization(p,
@@ -307,6 +323,26 @@ tsch_packet_create_eb(uint8_t *hdr_len, uint8_t *tsch_sync_ie_offset)
   }
   p += ie_len;
   packetbuf_set_datalen(packetbuf_datalen() + ie_len);
+
+#if TSCH_WITH_IMPLICIT_ACK
+  ie_len = frame80215e_create_ie_tsch_ia_grandparent(p,
+                                                     packetbuf_remaininglen(),
+                                                     &ies);
+  if(ie_len < 0) {
+    return -1;
+  }
+  p += ie_len;
+  packetbuf_set_datalen(packetbuf_datalen() + ie_len);
+
+  ie_len = frame80215e_create_ie_tsch_ia_children(p,
+                                                  packetbuf_remaininglen(),
+                                                  &ies);
+  if(ie_len < 0) {
+    return -1;
+  }
+  p += ie_len;
+  packetbuf_set_datalen(packetbuf_datalen() + ie_len);
+#endif /* TSCH_WITH_IMPLICIT_ACK */
 
 #if 0
   /* Payload IE list termination: optional */

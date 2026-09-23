@@ -109,6 +109,52 @@ frequency hopping for enhanced reliability.
 #define TSCH_CALLBACK_ROOT_NODE_UPDATED orchestra_callback_root_node_updated
 #endif /* TSCH_CALLBACK_ROOT_NODE_UPDATED */
 
+#if TSCH_WITH_IMPLICIT_ACK
+#ifndef TSCH_CALLBACK_NEW_ASFN
+#define TSCH_CALLBACK_NEW_ASFN orchestra_ia_new_asfn
+#endif /* TSCH_CALLBACK_NEW_ASFN */
+
+#ifndef TSCH_CALLBACK_UNICAST_DATA_INPUT
+#define TSCH_CALLBACK_UNICAST_DATA_INPUT orchestra_ia_data_input
+#endif /* TSCH_CALLBACK_UNICAST_DATA_INPUT */
+
+#ifndef TSCH_CALLBACK_IMPLICIT_ACK_ACTIVE
+#define TSCH_CALLBACK_IMPLICIT_ACK_ACTIVE orchestra_ia_implicit_ack_active
+#endif /* TSCH_CALLBACK_IMPLICIT_ACK_ACTIVE */
+
+#ifndef TSCH_CALLBACK_IA_OVERHEAR
+#define TSCH_CALLBACK_IA_OVERHEAR orchestra_ia_overhear
+#endif /* TSCH_CALLBACK_IA_OVERHEAR */
+
+#ifndef TSCH_CALLBACK_IA_OWN_PARENT
+#define TSCH_CALLBACK_IA_OWN_PARENT orchestra_ia_get_own_parent
+#endif /* TSCH_CALLBACK_IA_OWN_PARENT */
+
+#ifndef TSCH_CALLBACK_IA_PARENT_EB
+#define TSCH_CALLBACK_IA_PARENT_EB orchestra_ia_parent_eb_input
+#endif /* TSCH_CALLBACK_IA_PARENT_EB */
+
+#ifndef TSCH_CALLBACK_IA_CONGESTION
+#define TSCH_CALLBACK_IA_CONGESTION orchestra_ia_get_own_congestion
+#endif /* TSCH_CALLBACK_IA_CONGESTION */
+
+#ifndef TSCH_CALLBACK_IA_PARENT_CONGESTION
+#define TSCH_CALLBACK_IA_PARENT_CONGESTION orchestra_ia_parent_congestion_input
+#endif /* TSCH_CALLBACK_IA_PARENT_CONGESTION */
+
+#ifndef TSCH_CALLBACK_IA_CONFIRMATION_CYCLES
+#define TSCH_CALLBACK_IA_CONFIRMATION_CYCLES orchestra_ia_confirmation_cycles
+#endif /* TSCH_CALLBACK_IA_CONFIRMATION_CYCLES */
+
+#ifndef TSCH_CALLBACK_IA_OWN_CHILDREN
+#define TSCH_CALLBACK_IA_OWN_CHILDREN orchestra_ia_get_own_children
+#endif /* TSCH_CALLBACK_IA_OWN_CHILDREN */
+
+#ifndef TSCH_CALLBACK_IA_CHILD_EB
+#define TSCH_CALLBACK_IA_CHILD_EB orchestra_ia_child_eb_input
+#endif /* TSCH_CALLBACK_IA_CHILD_EB */
+#endif /* TSCH_WITH_IMPLICIT_ACK */
+
 #endif /* BUILD_WITH_ORCHESTRA */
 
 /* Called by TSCH when joining a network */
@@ -148,10 +194,126 @@ void TSCH_CALLBACK_NEW_TIME_SOURCE(const struct tsch_neighbor *old, const struct
 int TSCH_CALLBACK_PACKET_READY(void);
 #endif
 
-/* Called when a new root node, including the local node, is detected to be added or removed */ 
+/* Called when a new root node, including the local node, is detected to be added or removed */
 #ifdef TSCH_CALLBACK_ROOT_NODE_UPDATED
 void TSCH_CALLBACK_ROOT_NODE_UPDATED(const linkaddr_t *, uint8_t is_added);
 #endif /* TSCH_CALLBACK_ROOT_NODE_UPDATED */
+
+/* Called by the scheduler (tsch_schedule_get_next_active_link) exactly once whenever
+ * the Absolute Slotframe Number (ASFN = ASN / TSCH_IA_SFS_SIZE) advances, so that
+ * autonomous, ASFN-rotating cells can be recomputed */
+#ifdef TSCH_CALLBACK_NEW_ASFN
+void TSCH_CALLBACK_NEW_ASFN(uint32_t asfn);
+#endif /* TSCH_CALLBACK_NEW_ASFN */
+
+/* Called from tsch_rx_process_pending() with the link-layer source address of an
+ * incoming unicast DATA frame, just before it is passed to packet_input(). Runs
+ * synchronously with any IP-layer forwarding decision made for that same frame,
+ * so it can be used to tag "who this outgoing (relayed) packet came from" */
+#ifdef TSCH_CALLBACK_UNICAST_DATA_INPUT
+void TSCH_CALLBACK_UNICAST_DATA_INPUT(const linkaddr_t *source);
+#endif /* TSCH_CALLBACK_UNICAST_DATA_INPUT */
+
+/* Called by send_packet() (tsch.c) to decide whether a unicast frame to addr
+ * should have its ACK request suppressed -- addr is reached via an implicit-
+ * ack-eligible autonomous cell (not the explicit-ack path near the root, and
+ * only once our own grandparent is known, since without it we could never
+ * overhear a matching relay to confirm the frame). This is the only point
+ * where the frame's on-air ack_required bit is still mutable. */
+#ifdef TSCH_CALLBACK_IMPLICIT_ACK_ACTIVE
+int TSCH_CALLBACK_IMPLICIT_ACK_ACTIVE(const linkaddr_t *addr);
+#endif /* TSCH_CALLBACK_IMPLICIT_ACK_ACTIVE */
+
+/* Called by tsch_rx_slot() when a frame is successfully received on a link
+ * with LINK_OPTION_IA_OVERHEAR set -- source/destination are neither us nor
+ * addressed to us. Implementation should check whether source == our parent
+ * and destination == our grandparent, and if so, confirm the corresponding
+ * pending packet (see struct tsch_packet's ia_pending field). payload/
+ * payload_len are the frame's raw bytes from immediately after the 802.15.4
+ * MAC header (i.e. the 6LoWPAN-compressed IP packet) -- needed to check the
+ * ORIGINAL IP-layer sender, since a RELAY_TX[child] position is shared by
+ * that child's entire subtree (see orchestra_ia_overhear()'s own comment):
+ * a source/destination match alone does not mean the frame carries THIS
+ * node's own packet rather than a passed-through descendant's. */
+#ifdef TSCH_CALLBACK_IA_OVERHEAR
+void TSCH_CALLBACK_IA_OVERHEAR(const linkaddr_t *source, const linkaddr_t *destination,
+                                struct tsch_link *link,
+                                const uint8_t *payload, uint16_t payload_len);
+#endif /* TSCH_CALLBACK_IA_OVERHEAR */
+
+/* Called by tsch_packet_create_eb() (tsch-packet.c) to fetch our own current
+ * parent's address, for inclusion in our EB so our children can learn their
+ * grandparent. Returns nonzero and writes *out and *out_is_root if we have a
+ * parent, 0 otherwise (e.g. we are the root). *out_is_root must be filled in
+ * here (via our own, locally-valid tsch_roots_is_root(&our_parent) check)
+ * rather than left for the receiving child to re-derive: tsch_roots_is_root()
+ * is only ever true for a root the *local* node is directly 1 hop from (its
+ * list is populated solely by hearing an EB with join_priority 0, see
+ * eb_input()/tsch-roots.c) -- a child 2+ hops from the root would always get
+ * a false negative asking about its own grandparent directly. */
+#ifdef TSCH_CALLBACK_IA_OWN_PARENT
+int TSCH_CALLBACK_IA_OWN_PARENT(linkaddr_t *out, uint8_t *out_is_root);
+#endif /* TSCH_CALLBACK_IA_OWN_PARENT */
+
+/* Called by eb_input() (tsch.c) when an EB from our own time source carries
+ * a grandparent-address IE, with that address (our own grandparent) and
+ * whether the sender (our parent) says that address is itself the root --
+ * see TSCH_CALLBACK_IA_OWN_PARENT's comment for why that bit must come from
+ * the sender rather than be re-derived locally. */
+#ifdef TSCH_CALLBACK_IA_PARENT_EB
+void TSCH_CALLBACK_IA_PARENT_EB(const linkaddr_t *grandparent, uint8_t grandparent_is_root);
+#endif /* TSCH_CALLBACK_IA_PARENT_EB */
+
+/* Called by tsch_packet_create_eb() (tsch-packet.c) to fetch our own current
+ * queue depth toward our own parent (self-originated + relayed traffic
+ * combined, 0-255), for inclusion in our EB so our children can size their
+ * own implicit-ack confirmation deadline against how backed up we actually
+ * are -- a child's own local confirm/timeout history can never see this by
+ * itself, since a relayed frame resolves synchronously at Tx time regardless
+ * of the child's deadline (see the comment in tsch_tx_slot() gating the
+ * deferred ia_pending path on self-originated traffic only). */
+#ifdef TSCH_CALLBACK_IA_CONGESTION
+uint8_t TSCH_CALLBACK_IA_CONGESTION(void);
+#endif /* TSCH_CALLBACK_IA_CONGESTION */
+
+/* Called by eb_input() (tsch.c) when an EB from our own time source carries
+ * our parent's own congestion byte (see TSCH_CALLBACK_IA_CONGESTION above).
+ * Unlike TSCH_CALLBACK_IA_PARENT_EB, not gated on the sender having a
+ * grandparent to report -- our parent's congestion is meaningful even if our
+ * parent is root-adjacent. */
+#ifdef TSCH_CALLBACK_IA_PARENT_CONGESTION
+void TSCH_CALLBACK_IA_PARENT_CONGESTION(uint8_t parent_congestion);
+#endif /* TSCH_CALLBACK_IA_PARENT_CONGESTION */
+
+/* Called by tsch_tx_slot() (tsch-slot-operation.c) when arming a self-
+ * originated implicit-ack-pending packet, to pick how many TSCH_IA_SFS_SIZE
+ * cycles to wait before declaring it unconfirmed. Implementation should
+ * derive this from the most recently received TSCH_CALLBACK_IA_PARENT_CONGESTION
+ * value, not from any local confirm/timeout history (see that callback's
+ * comment for why a local signal can't work). */
+#ifdef TSCH_CALLBACK_IA_CONFIRMATION_CYCLES
+uint8_t TSCH_CALLBACK_IA_CONFIRMATION_CYCLES(void);
+#endif /* TSCH_CALLBACK_IA_CONFIRMATION_CYCLES */
+
+/* Called by tsch_packet_create_eb() (tsch-packet.c) to fetch our own direct
+ * children's addresses, for inclusion in our EB so our own parent (their
+ * grandparent) can install a matching Rx cell for each of our RELAY_TX
+ * cells. Returns the number of addresses written into out (capped at
+ * max_children). */
+#ifdef TSCH_CALLBACK_IA_OWN_CHILDREN
+uint8_t TSCH_CALLBACK_IA_OWN_CHILDREN(linkaddr_t *out, uint8_t *out_has_descendants, uint8_t max_children);
+#endif /* TSCH_CALLBACK_IA_OWN_CHILDREN */
+
+/* Called by eb_input() (tsch.c) for every received EB, with its source
+ * address and the (possibly empty) list of children addresses it carries.
+ * Unlike TSCH_CALLBACK_IA_PARENT_EB, not gated on the EB being from our own
+ * time source: this fires for an EB from any neighbor, and the callback
+ * itself must check whether that neighbor is actually one of our own
+ * children before acting on the list. */
+#ifdef TSCH_CALLBACK_IA_CHILD_EB
+void TSCH_CALLBACK_IA_CHILD_EB(const linkaddr_t *source, const linkaddr_t *children,
+                                const uint8_t *children_has_descendants, uint8_t num_children);
+#endif /* TSCH_CALLBACK_IA_CHILD_EB */
 
 
 /***** External Variables *****/
@@ -190,6 +352,26 @@ extern int32_t min_drift_seen;
 extern int32_t max_drift_seen;
 /* The TSCH standard 10ms timeslot timing */
 extern const tsch_timeslot_timing_usec tsch_timeslot_timing_us_10000;
+#if TSCH_WITH_IMPLICIT_ACK
+/* The short (5ms) implicit-ack-only timeslot timing -- see its definition
+ * in tsch-timeslot-timing.c for the timing budget this assumes. */
+extern const tsch_timeslot_timing_usec tsch_timeslot_timing_us_short_5000;
+/* Switch a link to the short timing template -- see its definition in
+ * tsch.c for which links should (and shouldn't) call this. */
+void tsch_ia_link_use_short_timing(struct tsch_link *l);
+#endif /* TSCH_WITH_IMPLICIT_ACK */
+
+/* Read timeslot timing element `elem` (a tsch_ts_* enum value) for a given
+ * link, in microseconds/rtimer ticks respectively: the link's own override
+ * if it set one (tsch_ia_link_use_short_timing()), otherwise the global
+ * default (tsch_timing_us/tsch_timing) -- so every existing call site that
+ * doesn't know about per-link timing continues to work unchanged, and only
+ * the ~15 call sites in tsch-slot-operation.c's tx/rx slot state machines
+ * (the ones that actually execute a specific link) need to switch to these. */
+#define TSCH_LINK_TIMING_US(link, elem) \
+  (((link) != NULL && (link)->timing_us != NULL) ? (link)->timing_us[elem] : tsch_timing_us[elem])
+#define TSCH_LINK_TIMING(link, elem) \
+  (((link) != NULL && (link)->timing_ticks != NULL) ? (link)->timing_ticks[elem] : tsch_timing[elem])
 
 /* TSCH processes */
 PROCESS_NAME(tsch_process);

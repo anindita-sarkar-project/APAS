@@ -68,6 +68,12 @@ MEMB(slotframe_memb, struct tsch_slotframe, TSCH_SCHEDULE_MAX_SLOTFRAMES);
 /* List of slotframes (each slotframe holds its own list of links) */
 LIST(slotframe_list);
 
+#if TSCH_WITH_IMPLICIT_ACK
+/* Last ASFN (Absolute Slotframe Number, ASN / TSCH_IA_SFS_SIZE) for which
+ * TSCH_CALLBACK_NEW_ASFN was fired. Sentinel -1 forces one call at startup. */
+static uint32_t tsch_ia_last_asfn = (uint32_t)-1;
+#endif /* TSCH_WITH_IMPLICIT_ACK */
+
 /* Adds and returns a slotframe (NULL if failure) */
 struct tsch_slotframe *
 tsch_schedule_add_slotframe(uint16_t handle, uint16_t size)
@@ -258,6 +264,8 @@ tsch_schedule_add_link(struct tsch_slotframe *slotframe,
         l->timeslot = timeslot;
         l->channel_offset = channel_offset;
         l->data = NULL;
+        l->timing_us = NULL;
+        l->timing_ticks = NULL;
         if(address == NULL) {
           address = &linkaddr_null;
         }
@@ -442,6 +450,27 @@ tsch_schedule_get_next_active_link(struct tsch_asn_t *asn, uint16_t *time_offset
   turns out useless when the time comes. For instance, for a Tx-only link, if there is
   no outgoing packet in queue. In that case, run the backup link instead. The backup link
   must have Rx flag set. */
+
+#if TSCH_WITH_IMPLICIT_ACK
+  {
+    /* Fire TSCH_CALLBACK_NEW_ASFN exactly once per ASFN increment, and do so
+     * BEFORE scanning for curr_best below: the callback mutates the timeslot/
+     * channel_offset of the caller's own rotating links (possibly including
+     * whatever ends up being curr_best), so it must settle first -- firing it
+     * after the scan would let the scan compute time_to_curr_best from
+     * about-to-change field values, then hand back a link already stale by
+     * the time the caller acts on it. ls4b-only division is safe: at 10ms
+     * slots, 32 bits covers >1300 years. */
+    uint32_t new_asfn = asn->ls4b / TSCH_IA_SFS_SIZE;
+    if(new_asfn != tsch_ia_last_asfn) {
+      tsch_ia_last_asfn = new_asfn;
+#ifdef TSCH_CALLBACK_NEW_ASFN
+      TSCH_CALLBACK_NEW_ASFN(new_asfn);
+#endif /* TSCH_CALLBACK_NEW_ASFN */
+    }
+  }
+#endif /* TSCH_WITH_IMPLICIT_ACK */
+
   if(!tsch_is_locked()) {
     struct tsch_slotframe *sf = list_head(slotframe_list);
     /* For each slotframe, look for the earliest occurring link */

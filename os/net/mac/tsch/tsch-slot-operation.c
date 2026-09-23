@@ -55,6 +55,8 @@
 #include "sys/critical.h"
 
 #include "sys/log.h"
+#define LOG_MODULE "TSCH-slot"
+#define LOG_LEVEL LOG_LEVEL_MAC
 /* TSCH debug macros, i.e. to set LEDs or GPIOs on various TSCH
  * timeslot events */
 #ifndef TSCH_DEBUG_INIT
@@ -386,6 +388,12 @@ get_packet_and_neighbor_for_link(struct tsch_link *link, struct tsch_neighbor **
         /* Get neighbor queue associated to the link and get packet from it */
         n = tsch_queue_get_nbr(&link->addr);
         p = tsch_queue_get_packet_for_nbr(n, link);
+        if(link->slotframe_handle >= 0x2000) {
+          int16_t head_idx = n != NULL ? ringbufindex_peek_get(&n->tx_ringbuf) : -1;
+          LOG_INFO("IATRACE relay-link served sf=%u ts=%u p=%p head_idx=%d head_sf_tag=%d\n",
+                   link->slotframe_handle, link->timeslot, (void *)p, head_idx,
+                   (n != NULL && head_idx != -1) ? queuebuf_attr(n->tx_array[head_idx]->qb, PACKETBUF_ATTR_TSCH_SLOTFRAME) : -1);
+        }
         /* if it is a broadcast slot and there were no broadcast packets, pick any unicast packet */
         if(p == NULL && n == n_broadcast) {
           p = tsch_queue_get_unicast_packet_for_any(&n, link);
@@ -556,8 +564,15 @@ PT_THREAD(tsch_tx_slot(struct pt *pt, struct rtimer *t))
       /* get payload */
       packet = queuebuf_dataptr(current_packet->qb);
       packet_len = queuebuf_datalen(current_packet->qb);
-      /* if is this a broadcast packet, don't wait for ack */
+      /* if is this a broadcast packet, don't wait for ack. For unicast,
+       * reflect whatever send_packet() (tsch.c) decided when the packet was
+       * queued: PACKETBUF_ATTR_MAC_ACK is 0 for implicit-ack-eligible
+       * destinations (see TSCH_CALLBACK_IMPLICIT_ACK_ACTIVE), in which case
+       * there is no explicit ack to wait for. */
       do_wait_for_ack = !current_neighbor->is_broadcast;
+#if TSCH_WITH_IMPLICIT_ACK
+      do_wait_for_ack = do_wait_for_ack && queuebuf_attr(current_packet->qb, PACKETBUF_ATTR_MAC_ACK);
+#endif /* TSCH_WITH_IMPLICIT_ACK */
       /* Unicast. More packets in queue for the neighbor? */
       burst_link_requested = 0;
       if(do_wait_for_ack
@@ -595,12 +610,12 @@ PT_THREAD(tsch_tx_slot(struct pt *pt, struct rtimer *t))
 #if TSCH_CCA_ENABLED
         cca_status = 1;
         /* delay before CCA */
-        TSCH_SCHEDULE_AND_YIELD(pt, t, current_slot_start, tsch_timing[tsch_ts_cca_offset], "cca");
+        TSCH_SCHEDULE_AND_YIELD(pt, t, current_slot_start, TSCH_LINK_TIMING(current_link, tsch_ts_cca_offset), "cca");
         TSCH_DEBUG_TX_EVENT();
         tsch_radio_on(TSCH_RADIO_CMD_ON_WITHIN_TIMESLOT);
         /* CCA */
         RTIMER_BUSYWAIT_UNTIL_ABS(!(cca_status &= NETSTACK_RADIO.channel_clear()),
-                           current_slot_start, tsch_timing[tsch_ts_cca_offset] + tsch_timing[tsch_ts_cca]);
+                           current_slot_start, TSCH_LINK_TIMING(current_link, tsch_ts_cca_offset) + TSCH_LINK_TIMING(current_link, tsch_ts_cca));
         TSCH_DEBUG_TX_EVENT();
         /* there is not enough time to turn radio off */
         /*  NETSTACK_RADIO.off(); */
@@ -610,17 +625,17 @@ PT_THREAD(tsch_tx_slot(struct pt *pt, struct rtimer *t))
 #endif /* TSCH_CCA_ENABLED */
         {
           /* delay before TX */
-          TSCH_SCHEDULE_AND_YIELD(pt, t, current_slot_start, tsch_timing[tsch_ts_tx_offset] - RADIO_DELAY_BEFORE_TX, "TxBeforeTx");
+          TSCH_SCHEDULE_AND_YIELD(pt, t, current_slot_start, TSCH_LINK_TIMING(current_link, tsch_ts_tx_offset) - RADIO_DELAY_BEFORE_TX, "TxBeforeTx");
           TSCH_DEBUG_TX_EVENT();
           /* send packet already in radio tx buffer */
           mac_tx_status = NETSTACK_RADIO.transmit(packet_len);
           tx_count++;
           /* Save tx timestamp */
-          tx_start_time = current_slot_start + tsch_timing[tsch_ts_tx_offset];
+          tx_start_time = current_slot_start + TSCH_LINK_TIMING(current_link, tsch_ts_tx_offset);
           /* calculate TX duration based on sent packet len */
           tx_duration = TSCH_PACKET_DURATION(packet_len);
           /* limit tx_time to its max value */
-          tx_duration = MIN(tx_duration, tsch_timing[tsch_ts_max_tx]);
+          tx_duration = MIN(tx_duration, TSCH_LINK_TIMING(current_link, tsch_ts_max_tx));
           /* turn tadio off -- will turn on again to wait for ACK if needed */
           tsch_radio_off(TSCH_RADIO_CMD_OFF_WITHIN_TIMESLOT);
 
@@ -640,9 +655,24 @@ PT_THREAD(tsch_tx_slot(struct pt *pt, struct rtimer *t))
               NETSTACK_RADIO.get_value(RADIO_PARAM_RX_MODE, &radio_rx_mode);
               NETSTACK_RADIO.set_value(RADIO_PARAM_RX_MODE, radio_rx_mode & (~RADIO_RX_MODE_ADDRESS_FILTER));
 #endif /* TSCH_HW_FRAME_FILTERING */
-              /* Unicast: wait for ack after tx: sleep until ack time */
+              /* Unicast: wait for ack after tx: sleep until ack time.
+               * Deliberately tsch_timing[...] (the global, regular-template
+               * values) unconditionally, not TSCH_LINK_TIMING(current_link,
+               * ...): this whole block only ever runs when do_wait_for_ack is
+               * true, i.e. a *real* explicit ack is actually expected for
+               * *this* packet -- regardless of whether current_link itself
+               * is currently short-timed for other (implicit-ack-eligible)
+               * traffic. RPL control traffic (DAO/DIS/unicast-DIO) shares
+               * UPLINK's/ROOT_ADJACENT's own cell tag rather than getting a
+               * dedicated one (see ia_is_rpl_control_packet()'s comment in
+               * orchestra-rule-implicit-ack.c for why a separate slotframe
+               * reintroduces head-of-queue cross-contamination), so exactly
+               * this situation -- an ack-requiring packet on a cell whose
+               * *other* traffic doesn't need one -- is the expected, normal
+               * case, not a corner case: the ACK budget must come from
+               * do_wait_for_ack, never from current_link's own template. */
               TSCH_SCHEDULE_AND_YIELD(pt, t, current_slot_start,
-                  tsch_timing[tsch_ts_tx_offset] + tx_duration + tsch_timing[tsch_ts_rx_ack_delay] - RADIO_DELAY_BEFORE_RX, "TxBeforeAck");
+                  TSCH_LINK_TIMING(current_link, tsch_ts_tx_offset) + tx_duration + tsch_timing[tsch_ts_rx_ack_delay] - RADIO_DELAY_BEFORE_RX, "TxBeforeAck");
               TSCH_DEBUG_TX_EVENT();
               tsch_radio_on(TSCH_RADIO_CMD_ON_WITHIN_TIMESLOT);
               /* Wait for ACK to come */
@@ -745,8 +775,69 @@ PT_THREAD(tsch_tx_slot(struct pt *pt, struct rtimer *t))
     current_packet->transmissions++;
     current_packet->ret = mac_tx_status;
 
-    /* Post TX: Update neighbor queue state */
-    in_queue = tsch_queue_packet_sent(current_neighbor, current_packet, current_link, mac_tx_status);
+#if TSCH_WITH_IMPLICIT_ACK
+    if(!current_neighbor->is_broadcast && mac_tx_status == MAC_TX_OK
+       && !queuebuf_attr(current_packet->qb, PACKETBUF_ATTR_MAC_ACK)
+       && queuebuf_attr(current_packet->qb, PACKETBUF_ATTR_TSCH_SLOTFRAME) < 0x2000) {
+      /* Radio-level Tx of an implicit-ack-eligible frame succeeded, but we
+       * skipped the ACK-wait window entirely (do_wait_for_ack was false
+       * above): MAC-level confirmation is deferred to whenever we overhear
+       * the parent's own relay of this frame to our grandparent (see
+       * TSCH_CALLBACK_IA_OVERHEAR in tsch_rx_slot(), and the timeout sweep
+       * in orchestra_ia_new_asfn()). Leave the packet at the head of the
+       * queue instead of resolving it now.
+       *
+       * The slotframe-tag check restricts this deferred path to our OWN
+       * self-originated uplink traffic (tagged with sf_short's own low
+       * handle) -- never a packet we are only relaying on a child's behalf
+       * (tagged with that child's dedicated relay_tx_sf, always allocated in
+       * the 0x2000+ range; see update_child_links()). A relay's implicit-ack
+       * confirmation is fundamentally not this node's to track: it comes
+       * from the ORIGINAL sender (the child, or a grandchild several hops
+       * further down) overhearing THIS transmission via THEIR OWN
+       * SELF_OVERHEAR cell, watching THEIR OWN pending packet in THEIR OWN
+       * queue. This node has no symmetric mechanism to ever confirm its own
+       * act of relaying -- root never relays anything further onward for a
+       * root-adjacent node to overhear, and no intermediate node's
+       * SELF_OVERHEAR cell is positioned anywhere near its own RELAY_TX
+       * transmission (it watches a completely different hop, its own uplink
+       * to its own parent). Before this check, every relay was armed
+       * ia_pending anyway, deferred to a deadline that could *only* ever
+       * expire, since nothing could ever confirm it -- forcing every single
+       * relayed frame, at every hop, through a full confirmation-timeout
+       * cycle before falling back to an ordinary (but entirely unnecessary)
+       * retry, even on a transmission that had already succeeded. Confirmed
+       * in testing: a relay's radio-level Tx succeeded on every attempt
+       * (clean RADIO_TX_OK, normal channel hopping) yet was retried
+       * repeatedly regardless, and this compounds multiplicatively with
+       * chain depth (every relay hop independently wastes up to
+       * max_transmissions attempts on frames that already succeeded) --
+       * root cause of the "80-100% even at 8-9 hops" delivery target being
+       * unreachable, not any inherent capacity limit. A relay's success is
+       * now resolved immediately below, exactly like a normal explicit-ack
+       * success, the moment the local radio confirms it went out. */
+      {
+        uint8_t ia_cycles = TSCH_IA_CONFIRMATION_TIMEOUT_CYCLES;
+#ifdef TSCH_CALLBACK_IA_CONFIRMATION_CYCLES
+        ia_cycles = TSCH_CALLBACK_IA_CONFIRMATION_CYCLES();
+#endif /* TSCH_CALLBACK_IA_CONFIRMATION_CYCLES */
+        current_packet->ia_pending = 1;
+        current_packet->ia_deadline_asn = tsch_current_asn;
+        TSCH_ASN_INC(current_packet->ia_deadline_asn, ia_cycles * TSCH_IA_SFS_SIZE);
+        current_packet->ia_link = current_link;
+      }
+      in_queue = 1;
+      LOG_INFO("IATRACE armed ia_pending asn=%lu deadline=%lu sf=%u ts=%u ch=%u dst=",
+               (unsigned long)tsch_current_asn.ls4b, (unsigned long)current_packet->ia_deadline_asn.ls4b,
+               current_link->slotframe_handle, current_link->timeslot, current_link->channel_offset);
+      LOG_INFO_LLADDR(queuebuf_addr(current_packet->qb, PACKETBUF_ADDR_RECEIVER));
+      LOG_INFO_("\n");
+    } else
+#endif /* TSCH_WITH_IMPLICIT_ACK */
+    {
+      /* Post TX: Update neighbor queue state */
+      in_queue = tsch_queue_packet_sent(current_neighbor, current_packet, current_link, mac_tx_status);
+    }
 
     /* The packet was dequeued, add it to dequeued_ringbuf for later processing */
     if(in_queue == 0) {
@@ -820,15 +911,30 @@ PT_THREAD(tsch_rx_slot(struct pt *pt, struct rtimer *t))
     static rtimer_clock_t packet_duration;
     uint8_t packet_seen;
 
-    expected_rx_time = current_slot_start + tsch_timing[tsch_ts_tx_offset];
+    expected_rx_time = current_slot_start + TSCH_LINK_TIMING(current_link, tsch_ts_tx_offset);
     /* Default start time: expected Rx time */
     rx_start_time = expected_rx_time;
 
     current_input = &input_array[input_index];
 
     /* Wait before starting to listen */
-    TSCH_SCHEDULE_AND_YIELD(pt, t, current_slot_start, tsch_timing[tsch_ts_rx_offset] - RADIO_DELAY_BEFORE_RX, "RxBeforeListen");
+    TSCH_SCHEDULE_AND_YIELD(pt, t, current_slot_start, TSCH_LINK_TIMING(current_link, tsch_ts_rx_offset) - RADIO_DELAY_BEFORE_RX, "RxBeforeListen");
     TSCH_DEBUG_RX_EVENT();
+
+#if TSCH_WITH_IMPLICIT_ACK && TSCH_HW_FRAME_FILTERING
+    {
+      int is_overhear_link = current_link != NULL && (current_link->link_options & LINK_OPTION_IA_OVERHEAR);
+      if(is_overhear_link) {
+        /* This cell's frame is addressed to our grandparent, not us: disable
+         * HW address filtering for it exactly as tsch_tx_slot() already does
+         * around its ACK-Rx window, or the radio would drop it before
+         * NETSTACK_RADIO.read() ever runs. */
+        radio_value_t radio_rx_mode;
+        NETSTACK_RADIO.get_value(RADIO_PARAM_RX_MODE, &radio_rx_mode);
+        NETSTACK_RADIO.set_value(RADIO_PARAM_RX_MODE, radio_rx_mode & (~RADIO_RX_MODE_ADDRESS_FILTER));
+      }
+    }
+#endif /* TSCH_WITH_IMPLICIT_ACK && TSCH_HW_FRAME_FILTERING */
 
     /* Start radio for at least guard time */
     tsch_radio_on(TSCH_RADIO_CMD_ON_WITHIN_TIMESLOT);
@@ -836,7 +942,7 @@ PT_THREAD(tsch_rx_slot(struct pt *pt, struct rtimer *t))
     if(!packet_seen) {
       /* Check if receiving within guard time */
       RTIMER_BUSYWAIT_UNTIL_ABS((packet_seen = (NETSTACK_RADIO.receiving_packet() || NETSTACK_RADIO.pending_packet())),
-          current_slot_start, tsch_timing[tsch_ts_rx_offset] + tsch_timing[tsch_ts_rx_wait] + RADIO_DELAY_BEFORE_DETECT);
+          current_slot_start, TSCH_LINK_TIMING(current_link, tsch_ts_rx_offset) + TSCH_LINK_TIMING(current_link, tsch_ts_rx_wait) + RADIO_DELAY_BEFORE_DETECT);
     }
     if(!packet_seen) {
       /* no packets on air */
@@ -848,9 +954,17 @@ PT_THREAD(tsch_rx_slot(struct pt *pt, struct rtimer *t))
 
       /* Wait until packet is received, turn radio off */
       RTIMER_BUSYWAIT_UNTIL_ABS(!NETSTACK_RADIO.receiving_packet(),
-          current_slot_start, tsch_timing[tsch_ts_rx_offset] + tsch_timing[tsch_ts_rx_wait] + tsch_timing[tsch_ts_max_tx]);
+          current_slot_start, TSCH_LINK_TIMING(current_link, tsch_ts_rx_offset) + TSCH_LINK_TIMING(current_link, tsch_ts_rx_wait) + TSCH_LINK_TIMING(current_link, tsch_ts_max_tx));
       TSCH_DEBUG_RX_EVENT();
       tsch_radio_off(TSCH_RADIO_CMD_OFF_WITHIN_TIMESLOT);
+
+#if TSCH_WITH_IMPLICIT_ACK && TSCH_HW_FRAME_FILTERING
+      if(current_link != NULL && (current_link->link_options & LINK_OPTION_IA_OVERHEAR)) {
+        radio_value_t radio_rx_mode;
+        NETSTACK_RADIO.get_value(RADIO_PARAM_RX_MODE, &radio_rx_mode);
+        NETSTACK_RADIO.set_value(RADIO_PARAM_RX_MODE, radio_rx_mode | RADIO_RX_MODE_ADDRESS_FILTER);
+      }
+#endif /* TSCH_WITH_IMPLICIT_ACK && TSCH_HW_FRAME_FILTERING */
 
       if(NETSTACK_RADIO.pending_packet()) {
         static int frame_valid;
@@ -877,7 +991,7 @@ PT_THREAD(tsch_rx_slot(struct pt *pt, struct rtimer *t))
 
         packet_duration = TSCH_PACKET_DURATION(current_input->len);
         /* limit packet_duration to its max value */
-        packet_duration = MIN(packet_duration, tsch_timing[tsch_ts_max_tx]);
+        packet_duration = MIN(packet_duration, TSCH_LINK_TIMING(current_link, tsch_ts_max_tx));
 
         if(!frame_valid) {
           TSCH_LOG_ADD(tsch_log_message,
@@ -911,6 +1025,66 @@ PT_THREAD(tsch_rx_slot(struct pt *pt, struct rtimer *t))
         }
 #endif /* LLSEC802154_ENABLED */
 
+#if TSCH_WITH_IMPLICIT_ACK
+        if(frame_valid && current_link != NULL
+           && (current_link->link_options & LINK_OPTION_IA_OVERHEAR)) {
+          /* This cell exists purely to overhear our parent's forward of our
+           * own earlier frame to our grandparent -- the frame is neither
+           * from nor addressed to us. Hand it to the Orchestra rule to
+           * decide whether it matches (source == our parent, destination ==
+           * our grandparent) and, if so, confirm the pending packet; either
+           * way, do not fall through to the normal "is this for us" gate
+           * below, since it never is for an overhear link. */
+#ifdef TSCH_CALLBACK_IA_OVERHEAR
+          TSCH_CALLBACK_IA_OVERHEAR(&source_address, &destination_address, current_link,
+                                     (const uint8_t *)current_input->payload + header_len,
+                                     current_input->len - header_len);
+#endif /* TSCH_CALLBACK_IA_OVERHEAR */
+          /* This overheard frame is also a completely ordinary, successful
+           * reception from our own time source (SELF_OVERHEAR's source is,
+           * by construction, our parent) -- feed it into clock sync exactly
+           * as the "is this for us" path below does at an ordinary
+           * reception, since skipping that here (as this branch otherwise
+           * would, by never reaching that path at all) silently removes
+           * this node's single most frequent contact with its time source.
+           * That matters a lot more than it would on a regular link: a
+           * non-root-adjacent node's own UPLINK never requests/gets an
+           * explicit ack once implicit-ack is active for it (do_wait_for_ack
+           * is false, so the Tx-side eack_time_correction path in
+           * tsch_tx_slot() never runs either), so this reception -- not the
+           * infrequent EB -- is normally its best chance to stay disciplined.
+           * Confirmed in testing: the first hop whose own uplink actually
+           * turns implicit-ack (grandparent no longer root, see
+           * ia_tx_short_timing_ok()) showed by far the worst overhear-
+           * confirmation ratio of any node in the tree even under light
+           * load -- consistent with exactly this resync path having been
+           * silently unavailable to it. */
+          {
+            struct tsch_neighbor *src_n = tsch_queue_get_nbr(&source_address);
+            if(src_n != NULL && src_n->is_time_source) {
+              int32_t since_last_timesync = TSCH_ASN_DIFF(tsch_current_asn, last_sync_asn);
+              estimated_drift = RTIMER_CLOCK_DIFF(expected_rx_time, rx_start_time);
+#if TSCH_TIMESYNC_REMOVE_JITTER
+              if(ABS(estimated_drift) <= TSCH_TIMESYNC_MEASUREMENT_ERROR) {
+                estimated_drift = 0;
+              } else if(estimated_drift > 0) {
+                estimated_drift -= TSCH_TIMESYNC_MEASUREMENT_ERROR;
+              } else {
+                estimated_drift += TSCH_TIMESYNC_MEASUREMENT_ERROR;
+              }
+#endif /* TSCH_TIMESYNC_REMOVE_JITTER */
+              tsch_stats_on_time_synchronization(estimated_drift);
+              last_sync_asn = tsch_current_asn;
+              tsch_last_sync_time = clock_time();
+              drift_correction = -estimated_drift;
+              is_drift_correction_used = 1;
+              sync_count++;
+              tsch_timesync_update(src_n, since_last_timesync, -estimated_drift);
+              tsch_schedule_keepalive(0);
+            }
+          }
+        } else
+#endif /* TSCH_WITH_IMPLICIT_ACK */
         if(frame_valid) {
           /* Check that frome is for us or broadcast, AND that it is not from
            * ourselves. This is for consistency with CSMA and to avoid adding
@@ -960,7 +1134,14 @@ PT_THREAD(tsch_rx_slot(struct pt *pt, struct rtimer *t))
                 /* Copy to radio buffer */
                 NETSTACK_RADIO.prepare((const void *)ack_buf, ack_len);
 
-                /* Wait for time to ACK and transmit ACK */
+                /* Wait for time to ACK and transmit ACK. Deliberately
+                 * tsch_timing[...] (regular template), not TSCH_LINK_TIMING(
+                 * current_link, ...) -- see the identical do_wait_for_ack
+                 * case in tsch_tx_slot(): this
+                 * whole block only runs when the received frame itself
+                 * requested an ack (frame.fcf.ack_required), so the ack
+                 * timing budget must be the regular template regardless of
+                 * whether current_link is otherwise short-timed. */
                 TSCH_SCHEDULE_AND_YIELD(pt, t, rx_start_time,
                                         packet_duration + tsch_timing[tsch_ts_tx_ack_delay] - RADIO_DELAY_BEFORE_TX, "RxBeforeAck");
                 TSCH_DEBUG_RX_EVENT();
@@ -1031,6 +1212,61 @@ PT_THREAD(tsch_rx_slot(struct pt *pt, struct rtimer *t))
 
   PT_END(pt);
 }
+/*---------------------------------------------------------------------------*/
+#if TSCH_WITH_IMPLICIT_ACK
+/* How much real time to reserve for `link`'s upcoming slot when computing
+ * time_to_next_active_slot (below): normally just its own timeslot length
+ * (TSCH_LINK_TIMING falls back to the regular/global value for any link
+ * that isn't short-timed, so this is a no-op change for every deployment
+ * that doesn't use implicit ack). For a short-timed (5ms) implicit-ack
+ * cell specifically, its own internal offsets (TxOffset/RxOffset/RxWait)
+ * stay short regardless -- those aren't ack-related -- but the *slot
+ * boundary* reservation must widen to the regular length whenever this
+ * specific upcoming slot could actually need the full explicit-ack budget
+ * (do_wait_for_ack on Tx, or an unpredictable incoming ack-request on Rx):
+ * both tsch_tx_slot() and tsch_rx_slot() already correctly widen their own
+ * ack-wait offsets to the regular template in exactly this situation (see
+ * their own comments), but that only helps if the *slot itself* actually
+ * has that much real time available -- otherwise the ack exchange
+ * overruns into the next scheduled slot's radio operations, corrupting it
+ * (the same class of bug backup_link's own timing mismatch caused
+ * earlier, just from a different source: an ack-requiring packet landing
+ * on a cell whose *other* traffic doesn't need one, which is the normal
+ * case for RPL control traffic sharing a data cell's tag rather than
+ * getting a dedicated one -- see ia_is_rpl_control_packet()'s comment in
+ * orchestra-rule-implicit-ack.c). For Tx-capable links the actual
+ * ack-requirement is predictable in advance (frozen at enqueue time in
+ * PACKETBUF_ATTR_MAC_ACK, peeked here the same way tsch_tx_slot() reads it
+ * when the slot actually runs) so only widens when truly needed; for
+ * Rx-capable, non-overhear links (RELAY_RX, the grandchild-relay-rx cell)
+ * an incoming frame's ack-request can't be predicted at all, so this
+ * conservatively always reserves the regular length -- correct, at the
+ * cost of not saving real time on cells that also do Rx (only Tx-only
+ * cells and Rx-only *overhear* links, which structurally never reply with
+ * an ack -- tsch_rx_slot()'s overhear branch bypasses that logic
+ * entirely -- get to keep the full short-duration benefit). */
+static rtimer_clock_t
+tsch_ia_reserved_timeslot_length(struct tsch_link *link)
+{
+  if(link == NULL || link->timing_ticks == NULL) {
+    return TSCH_LINK_TIMING(link, tsch_ts_timeslot_length);
+  }
+  if(link->link_options & LINK_OPTION_TX) {
+    struct tsch_neighbor *n = tsch_queue_get_nbr(&link->addr);
+    struct tsch_packet *p = tsch_queue_get_head_packet(n);
+    if(p != NULL && queuebuf_attr(p->qb, PACKETBUF_ATTR_MAC_ACK)) {
+      return tsch_timing[tsch_ts_timeslot_length];
+    }
+    return TSCH_LINK_TIMING(link, tsch_ts_timeslot_length);
+  }
+  if((link->link_options & LINK_OPTION_RX) && !(link->link_options & LINK_OPTION_IA_OVERHEAR)) {
+    return tsch_timing[tsch_ts_timeslot_length];
+  }
+  return TSCH_LINK_TIMING(link, tsch_ts_timeslot_length);
+}
+#else /* TSCH_WITH_IMPLICIT_ACK */
+#define tsch_ia_reserved_timeslot_length(link) TSCH_LINK_TIMING(link, tsch_ts_timeslot_length)
+#endif /* TSCH_WITH_IMPLICIT_ACK */
 /*---------------------------------------------------------------------------*/
 /* Protothread for slot operation, called from rtimer interrupt
  * and scheduled from tsch_schedule_slot_operation */
@@ -1130,9 +1366,28 @@ PT_THREAD(tsch_slot_operation(struct rtimer *t, void *ptr))
       tsch_last_sync_time = clock_time();
     }
 
-    /* Do we need to resynchronize? i.e., wait for EB again */
+    /* Do we need to resynchronize? i.e., wait for EB again.
+     * TSCH_DESYNC_THRESHOLD is a real-time (clock) budget, converted here
+     * into an ASN-tick count via a *fixed* timeslot length. With per-link
+     * timing (TSCH_WITH_IMPLICIT_ACK), ASN no longer advances at one fixed
+     * rate: a schedule dominated by short (5ms) implicit-ack cells advances
+     * ASN roughly twice as fast per unit of real time as the regular 10ms
+     * length assumes, so converting with the regular length turns this into
+     * a too-small ASN-tick count -- legitimate nodes then rack up more ASN
+     * ticks than that between two perfectly normal EB receptions and get
+     * spuriously disassociated (confirmed in testing: nodes 2 and 3 both
+     * left the network mid-run with no real loss of sync). Converting with
+     * the *shortest* possible timeslot length instead makes the resulting
+     * ASN-tick threshold generous enough to tolerate the fastest ASN
+     * advancement rate the schedule can ever actually produce. */
+#if TSCH_WITH_IMPLICIT_ACK
+    if(!tsch_is_coordinator && (TSCH_ASN_DIFF(tsch_current_asn, last_sync_asn) >
+        (100 * TSCH_CLOCK_TO_SLOTS(TSCH_DESYNC_THRESHOLD / 100,
+            US_TO_RTIMERTICKS(tsch_timeslot_timing_us_short_5000[tsch_ts_timeslot_length]))))) {
+#else /* TSCH_WITH_IMPLICIT_ACK */
     if(!tsch_is_coordinator && (TSCH_ASN_DIFF(tsch_current_asn, last_sync_asn) >
         (100 * TSCH_CLOCK_TO_SLOTS(TSCH_DESYNC_THRESHOLD / 100, tsch_timing[tsch_ts_timeslot_length])))) {
+#endif /* TSCH_WITH_IMPLICIT_ACK */
       TSCH_LOG_ADD(tsch_log_message,
             snprintf(log->message, sizeof(log->message),
                 "! leaving the network, last sync %u",
@@ -1173,8 +1428,32 @@ PT_THREAD(tsch_slot_operation(struct rtimer *t, void *ptr))
 
         /* Update ASN */
         TSCH_ASN_INC(tsch_current_asn, timeslot_diff);
-        /* Time to next wake up */
-        time_to_next_active_slot = timeslot_diff * tsch_timing[tsch_ts_timeslot_length] + drift_correction;
+        /* Time to next wake up. Uses the just-fetched current_link's own
+         * timeslot length (correct whenever timeslot_diff == 1, the common
+         * case; a rare timeslot_diff > 1 -- consecutive ASNs with no active
+         * link at all in any slotframe -- approximates using this same
+         * link's length for the skipped gap too, exactly as the previous,
+         * single-global-length code implicitly did for every gap.
+         *
+         * If backup_link's own timing template differs from current_link's,
+         * the real-time budget reserved for this slot must cover whichever
+         * one actually ends up running: the do_skip_best_link fallback just
+         * below (next loop iteration) can still switch to backup_link *after*
+         * this slot's real-time length has already been fixed here, if
+         * current_link (chosen as "best") turns out to have no packet ready.
+         * Reserving only current_link's (possibly shorter) length in that
+         * case lets backup_link's own internal offsets -- sized for its own,
+         * longer template -- run past this slot's actual boundary and into
+         * the next one's, corrupting whichever link follows (confirmed in
+         * testing: an explicit-ack cell's ACK reception window intermittently
+         * failing only when a shorter implicit-ack cell happened to be its
+         * current_link/backup_link pair, never otherwise). Taking the larger
+         * of the two lengths is always safe -- it only ever adds idle radio
+         * time, never removes needed margin. */
+        time_to_next_active_slot = timeslot_diff *
+            MAX(tsch_ia_reserved_timeslot_length(current_link),
+                tsch_ia_reserved_timeslot_length(backup_link))
+            + drift_correction;
         time_to_next_active_slot += tsch_timesync_adaptive_compensate(time_to_next_active_slot);
         drift_correction = 0;
         is_drift_correction_used = 0;
@@ -1211,8 +1490,12 @@ tsch_slot_operation_start(void)
     }
     /* Update ASN */
     TSCH_ASN_INC(tsch_current_asn, timeslot_diff);
-    /* Time to next wake up */
-    time_to_next_active_slot = timeslot_diff * tsch_timing[tsch_ts_timeslot_length];
+    /* Time to next wake up -- see the identical calculation's comment in
+     * tsch_slot_operation() for why using the larger of current_link's and
+     * backup_link's own timing here is correct. */
+    time_to_next_active_slot = timeslot_diff *
+        MAX(tsch_ia_reserved_timeslot_length(current_link),
+            tsch_ia_reserved_timeslot_length(backup_link));
     /* Compensate for the base drift */
     time_to_next_active_slot += tsch_timesync_adaptive_compensate(time_to_next_active_slot);
     /* Update current slot start */

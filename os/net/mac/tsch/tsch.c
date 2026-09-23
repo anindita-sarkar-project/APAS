@@ -100,6 +100,15 @@ uint16_t tsch_timing_us[tsch_ts_elements_count];
 /* TSCH timeslot timing (in rtimer ticks) */
 rtimer_clock_t tsch_timing[tsch_ts_elements_count];
 
+#if TSCH_WITH_IMPLICIT_ACK
+/* rtimer-ticks conversion of tsch_timeslot_timing_us_short_5000, computed
+ * once (tsch_reset()) alongside the global tsch_timing/tsch_timing_us
+ * conversion -- a single shared array pointed at by every link that opts
+ * into the short template (tsch_ia_link_use_short_timing()), not a
+ * per-link allocation. */
+static rtimer_clock_t tsch_ia_short_timing_ticks[tsch_ts_elements_count];
+#endif /* TSCH_WITH_IMPLICIT_ACK */
+
 #if LINKADDR_SIZE == 8
 /* 802.15.4 broadcast MAC address  */
 const linkaddr_t tsch_broadcast_address = { { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff } };
@@ -220,6 +229,9 @@ tsch_reset(void)
   for(i = 0; i < tsch_ts_elements_count; i++) {
     tsch_timing_us[i] = tsch_default_timing_us[i];
     tsch_timing[i] = US_TO_RTIMERTICKS(tsch_timing_us[i]);
+#if TSCH_WITH_IMPLICIT_ACK
+    tsch_ia_short_timing_ticks[i] = US_TO_RTIMERTICKS(tsch_timeslot_timing_us_short_5000[i]);
+#endif /* TSCH_WITH_IMPLICIT_ACK */
   }
 #ifdef TSCH_CALLBACK_LEAVING_NETWORK
   TSCH_CALLBACK_LEAVING_NETWORK();
@@ -238,6 +250,25 @@ tsch_reset(void)
   tsch_set_eb_period(TSCH_EB_PERIOD);
   keepalive_status = KEEPALIVE_SCHEDULING_UNCHANGED;
 }
+#if TSCH_WITH_IMPLICIT_ACK
+/*---------------------------------------------------------------------------*/
+/* Switch a link to the short (5ms), implicit-ack-only timeslot template --
+ * see tsch_timeslot_timing_us_short_5000 (tsch-timeslot-timing.c) and
+ * TSCH_LINK_TIMING_US/TSCH_LINK_TIMING (tsch.h). Every non-root-adjacent
+ * implicit-ack cell (UPLINK, RELAY_TX, RELAY_RX, SELF_OVERHEAR, the
+ * grandchild-relay Rx cell) should call this once, right after creation;
+ * ROOT_ADJACENT and every other (non-implicit-ack) link leave timing_us/
+ * timing_ticks at their tsch_schedule_add_link()-initialized NULL, keeping
+ * the regular template, explicit-ack timing unchanged. */
+void
+tsch_ia_link_use_short_timing(struct tsch_link *l)
+{
+  if(l != NULL) {
+    l->timing_us = tsch_timeslot_timing_us_short_5000;
+    l->timing_ticks = tsch_ia_short_timing_ticks;
+  }
+}
+#endif /* TSCH_WITH_IMPLICIT_ACK */
 /* TSCH keep-alive functions */
 
 /*---------------------------------------------------------------------------*/
@@ -486,7 +517,44 @@ eb_input(struct input_packet *current_input)
           }
         }
       }
+
+#if TSCH_WITH_IMPLICIT_ACK
+      /* Our own parent's own parent, i.e. our grandparent, for the implicit-
+       * ack overhear mechanism. Refreshed on every EB from our time source
+       * (not just on a time-source switch): the grandparent's identity
+       * itself doesn't change often, but re-processing here is cheap and
+       * keeps this in sync if our parent's own parent ever changes. */
+#ifdef TSCH_CALLBACK_IA_PARENT_EB
+      if(eb_ies.ie_ia_has_grandparent) {
+        TSCH_CALLBACK_IA_PARENT_EB(&eb_ies.ie_ia_grandparent, eb_ies.ie_ia_grandparent_is_root);
+      }
+#endif /* TSCH_CALLBACK_IA_PARENT_EB */
+      /* Our parent's own current queue depth, refreshed on every EB from our
+       * time source -- unlike the grandparent tag above, not gated on
+       * ie_ia_has_grandparent: our parent's congestion is meaningful even
+       * when our parent is root-adjacent and so has no grandparent to
+       * report. */
+#ifdef TSCH_CALLBACK_IA_PARENT_CONGESTION
+      TSCH_CALLBACK_IA_PARENT_CONGESTION(eb_ies.ie_ia_parent_congestion);
+#endif /* TSCH_CALLBACK_IA_PARENT_CONGESTION */
+#endif /* TSCH_WITH_IMPLICIT_ACK */
     }
+
+#if TSCH_WITH_IMPLICIT_ACK
+    /* Our own children's own children, i.e. our grandchildren, for
+     * installing a matching Rx cell for each grandchild's RELAY_TX cell.
+     * Unlike the grandparent IE above, this is *not* gated on "from our
+     * time source": the EB carrying this is from one of our own RPL/
+     * Orchestra children, a completely different neighbor relationship (our
+     * time source is our own parent, further up the tree). The callback
+     * itself checks whether frame.src_addr is actually a known child of
+     * ours before acting on it. */
+#ifdef TSCH_CALLBACK_IA_CHILD_EB
+    TSCH_CALLBACK_IA_CHILD_EB((linkaddr_t *)&frame.src_addr,
+                              eb_ies.ie_ia_children, eb_ies.ie_ia_children_has_descendants,
+                              eb_ies.ie_ia_num_children);
+#endif /* TSCH_CALLBACK_IA_CHILD_EB */
+#endif /* TSCH_WITH_IMPLICIT_ACK */
   }
 }
 /*---------------------------------------------------------------------------*/
@@ -510,6 +578,12 @@ tsch_rx_process_pending()
       packetbuf_copyfrom(current_input->payload, current_input->len);
       packetbuf_set_attr(PACKETBUF_ATTR_RSSI, current_input->rssi);
       packetbuf_set_attr(PACKETBUF_ATTR_CHANNEL, current_input->channel);
+
+#if TSCH_WITH_IMPLICIT_ACK
+#ifdef TSCH_CALLBACK_UNICAST_DATA_INPUT
+      TSCH_CALLBACK_UNICAST_DATA_INPUT((const linkaddr_t *)&frame.src_addr);
+#endif /* TSCH_CALLBACK_UNICAST_DATA_INPUT */
+#endif /* TSCH_WITH_IMPLICIT_ACK */
 
       /* Pass to upper layers */
       packet_input();
@@ -1105,10 +1179,27 @@ send_packet(mac_callback_t sent, void *ptr)
     return;
   }
 
-  /* Ask for ACK if we are sending anything other than broadcast */
+  /* Ask for ACK if we are sending anything other than broadcast, unless the
+   * destination is reached via an implicit-ack-eligible cell -- in which
+   * case suppressing the ACK request here is required, not optional: this
+   * is the only point where the frame's on-air ack_required bit is still
+   * mutable (NETSTACK_FRAMER.create() below bakes it in, and it's consumed
+   * long before any Orchestra rule's select_packet() gets a say). Without
+   * this, every "implicit-ack" frame would still request and get a real
+   * EACK, defeating the mechanism regardless of the rest of the implementation. */
   if(!linkaddr_cmp(addr, &linkaddr_null)) {
     mac_sequence_set_dsn();
+#if TSCH_WITH_IMPLICIT_ACK
+#ifdef TSCH_CALLBACK_IMPLICIT_ACK_ACTIVE
+    if(!TSCH_CALLBACK_IMPLICIT_ACK_ACTIVE(addr)) {
+      packetbuf_set_attr(PACKETBUF_ATTR_MAC_ACK, 1);
+    }
+#else
     packetbuf_set_attr(PACKETBUF_ATTR_MAC_ACK, 1);
+#endif /* TSCH_CALLBACK_IMPLICIT_ACK_ACTIVE */
+#else /* TSCH_WITH_IMPLICIT_ACK */
+    packetbuf_set_attr(PACKETBUF_ATTR_MAC_ACK, 1);
+#endif /* TSCH_WITH_IMPLICIT_ACK */
   } else {
     /* Broadcast packets shall be added to broadcast queue
      * The broadcast address in Contiki is linkaddr_null which is equal

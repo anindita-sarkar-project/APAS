@@ -85,6 +85,43 @@ struct ieee802154_ies {
   /* We include and parse only the sequence len and list and omit unused fields */
   uint16_t ie_hopping_sequence_len;
   uint8_t ie_hopping_sequence_list[TSCH_HOPPING_SEQUENCE_MAX_LEN];
+#if TSCH_WITH_IMPLICIT_ACK
+  /* Non-standard MLME short sub-IE: sender's own parent address (i.e. the
+   * receiving child's grandparent), if any, and whether that parent is
+   * itself the network root. The receiving child cannot determine the
+   * latter fact on its own via tsch_roots_is_root(): that list is only ever
+   * populated by directly hearing an EB with join_priority 0 (tsch.c's
+   * eb_input()), i.e. it only ever holds roots the *local* node is 1 hop
+   * from -- a grandparent 2+ hops away is never in it regardless of whether
+   * it truly is the root. The sender (the child's parent) knows the answer
+   * correctly, from its own, valid 1-hop check, and must hand it down. */
+  uint8_t ie_ia_has_grandparent;
+  linkaddr_t ie_ia_grandparent;
+  uint8_t ie_ia_grandparent_is_root;
+  /* Non-standard: sender's own current queue depth toward its own parent
+   * (self-originated + relayed traffic combined), 0-255. Piggybacked on the
+   * same IE as the grandparent tag above (both flow parent -> child, and
+   * both are refreshed on every periodic EB, not just on a topology change).
+   * This is the real, cross-boundary congestion signal a child needs to size
+   * its own implicit-ack confirmation deadline: a child's OWN local
+   * confirm/timeout history only reflects its own traffic and can never see
+   * that its parent's relay queue is backed up -- seeing that requires the
+   * parent to say so directly. See orchestra_ia_confirmation_cycles(). */
+  uint8_t ie_ia_parent_congestion;
+  /* Non-standard MLME short sub-IE: sender's own direct children's
+   * addresses, so the sender's own parent (this child's grandparent) can
+   * install a matching Rx cell for each grandchild's relayed traffic --
+   * see MLME_SHORT_IE_TSCH_IA_CHILDREN's comment in frame802154e-ie.c.
+   * ie_ia_children_has_descendants[i] carries whether ie_ia_children[i]
+   * itself has any children of its own (the sender already knows this
+   * locally, from its own child_has_descendants() check) -- the grandparent
+   * needs this to decide whether that grandchild's relay actually uses more
+   * than one RELAY_TX shard, so it installs a matching number of Rx
+   * positions rather than always defensively covering the maximum. */
+  uint8_t ie_ia_num_children;
+  linkaddr_t ie_ia_children[TSCH_IA_IE_MAX_CHILDREN];
+  uint8_t ie_ia_children_has_descendants[TSCH_IA_IE_MAX_CHILDREN];
+#endif /* TSCH_WITH_IMPLICIT_ACK */
 #if TSCH_WITH_SIXTOP
   /* Payload Sixtop IE */
   const uint8_t *sixtop_ie_content_ptr;
@@ -127,6 +164,14 @@ int frame80215e_create_ie_tsch_timeslot(uint8_t *buf, int len,
 /* MLME sub-IE. TSCH channel hopping sequence. Used in EBs: hopping sequence */
 int frame80215e_create_ie_tsch_channel_hopping_sequence(uint8_t *buf, int len,
     const struct ieee802154_ies *ies);
+#if TSCH_WITH_IMPLICIT_ACK
+/* MLME sub-IE. Non-standard: sender's own parent address (grandparent IE) */
+int frame80215e_create_ie_tsch_ia_grandparent(uint8_t *buf, int len,
+    const struct ieee802154_ies *ies);
+/* MLME sub-IE. Non-standard: sender's own direct children's addresses */
+int frame80215e_create_ie_tsch_ia_children(uint8_t *buf, int len,
+    const struct ieee802154_ies *ies);
+#endif /* TSCH_WITH_IMPLICIT_ACK */
 
 /* Parse all Information Elements of a frame */
 int frame802154e_parse_information_elements(const uint8_t *buf, uint8_t buf_size,

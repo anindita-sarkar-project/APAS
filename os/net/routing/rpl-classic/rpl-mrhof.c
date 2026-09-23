@@ -88,8 +88,18 @@
  * PARENT_SWITCH_THRESHOLD_DIV in order to switch preferred
  * parent. Default in RFC6719: 192, eq ETX of 1.5.  We use a more
  * aggressive setting: 96, eq ETX of 0.75.
- */
+ *
+ * Overridable via PARENT_SWITCH_THRESHOLD_CONF for topologies where the more
+ * aggressive default causes excessive parent-switch churn (e.g. a grid,
+ * where many nodes sit equidistant from multiple candidate parents) --
+ * every switch forces autonomous-scheduler cells keyed off the parent's
+ * address to relocate, so reducing switch frequency at the source helps
+ * more than trying to make scheduling merely tolerate a high switch rate. */
+#ifdef PARENT_SWITCH_THRESHOLD_CONF
+#define PARENT_SWITCH_THRESHOLD PARENT_SWITCH_THRESHOLD_CONF
+#else /* PARENT_SWITCH_THRESHOLD_CONF */
 #define PARENT_SWITCH_THRESHOLD 96 /* Eq ETX of 0.75 */
+#endif /* PARENT_SWITCH_THRESHOLD_CONF */
 #else /* !RPL_MRHOF_SQUARED_ETX */
 #define MAX_LINK_METRIC     2048 /* Eq ETX of 4 */
 #define PARENT_SWITCH_THRESHOLD 160 /* Eq ETX of 1.25 (results in a churn comparable

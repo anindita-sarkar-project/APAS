@@ -55,11 +55,15 @@ struct orchestra_rule {
 };
 
 extern struct orchestra_rule eb_per_time_source;
+extern struct orchestra_rule eb_fixed_shared;
 extern struct orchestra_rule unicast_per_neighbor_rpl_storing;
 extern struct orchestra_rule unicast_per_neighbor_rpl_ns;
 extern struct orchestra_rule unicast_per_neighbor_link_based;
 extern struct orchestra_rule special_for_root;
 extern struct orchestra_rule default_common;
+extern struct orchestra_rule implicit_ack_tree;
+extern struct orchestra_rule child_grandchild_tree;
+extern struct orchestra_rule subtree_traffic_tree;
 
 extern linkaddr_t orchestra_parent_linkaddr;
 extern int orchestra_parent_knows_us;
@@ -82,5 +86,27 @@ uint8_t orchestra_is_root_schedule_active(const linkaddr_t *addr);
 void orchestra_callback_root_node_updated(const linkaddr_t *root, uint8_t is_added);
 /* Set with #define NETSTACK_CONF_DS6_NEIGHBOR_UPDATED_CALLBACK orchestra_callback_neighbor_updated */
 void orchestra_callback_neighbor_updated(const linkaddr_t *, uint8_t is_added);
+
+#if TSCH_WITH_IMPLICIT_ACK
+/* Set with #define TSCH_CALLBACK_NEW_ASFN orchestra_ia_new_asfn */
+void orchestra_ia_new_asfn(uint32_t asfn);
+/* Set with #define TSCH_CALLBACK_UNICAST_DATA_INPUT orchestra_ia_data_input */
+void orchestra_ia_data_input(const linkaddr_t *source);
+/* Set with #define TSCH_CALLBACK_IA_PARENT_EB orchestra_ia_parent_eb_input */
+void orchestra_ia_parent_eb_input(const linkaddr_t *grandparent, uint8_t grandparent_is_root);
+/* Set with #define TSCH_CALLBACK_IA_OWN_PARENT orchestra_ia_get_own_parent */
+int orchestra_ia_get_own_parent(linkaddr_t *out, uint8_t *out_is_root);
+/* Set with #define TSCH_CALLBACK_IA_OWN_CHILDREN orchestra_ia_get_own_children */
+uint8_t orchestra_ia_get_own_children(linkaddr_t *out, uint8_t *out_has_descendants, uint8_t max_children);
+/* Set with #define TSCH_CALLBACK_IA_CHILD_EB orchestra_ia_child_eb_input */
+void orchestra_ia_child_eb_input(const linkaddr_t *source, const linkaddr_t *children,
+                                  const uint8_t *children_has_descendants, uint8_t num_children);
+/* Set with #define TSCH_CALLBACK_IMPLICIT_ACK_ACTIVE orchestra_ia_implicit_ack_active */
+int orchestra_ia_implicit_ack_active(const linkaddr_t *addr);
+/* Set with #define TSCH_CALLBACK_IA_OVERHEAR orchestra_ia_overhear */
+void orchestra_ia_overhear(const linkaddr_t *source, const linkaddr_t *destination,
+                            struct tsch_link *link,
+                            const uint8_t *payload, uint16_t payload_len);
+#endif /* TSCH_WITH_IMPLICIT_ACK */
 
 #endif /* ORCHESTRA_H_ */

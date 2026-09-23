@@ -93,4 +93,35 @@ const tsch_timeslot_timing_usec tsch_timeslot_timing_us_10000 = {
   10000, /* TimeslotLength */
 };
 
+/**
+ * \brief Short timeslot timing for implicit-ack cells: no explicit ACK is
+ * ever requested, sent, or waited for on these links (see TSCH_WITH_
+ * IMPLICIT_ACK, orchestra-rule-implicit-ack.c), so the entire ACK round-trip
+ * budget (RxAckDelay+AckWait+MaxAck+TxAckDelay, ~4600us of the regular
+ * template's 10000us) is dropped instead of just left unused. MaxTx is left
+ * at the same value as the regular template (still supports a full-length
+ * 127-byte frame at 250kbps) -- what's compressed instead is the pre-Tx
+ * guard time (TxOffset 2120->700, RxWait 2200->200), which is what makes
+ * fitting a full-length frame into ~5ms possible at all. This assumes
+ * tighter clock synchronization tolerance than the standard's own default
+ * guard times provide margin for; that trade-off is fine for a simulated
+ * radio medium (Cooja) or a network with a fast, frequent time source, but
+ * would need re-validating (wider RxWait) against real clock drift before
+ * use on real hardware over a slow time-source refresh interval.
+ */
+const tsch_timeslot_timing_usec tsch_timeslot_timing_us_short_5000 = {
+    200, /* CCAOffset */
+    128, /* CCA (unused: CCA is not enabled by default) */
+    700, /* TxOffset */
+  (700 - (TSCH_IA_SHORT_RX_WAIT / 2)), /* RxOffset */
+      0, /* RxAckDelay (no ACK ever sent/awaited on implicit-ack links) */
+      0, /* TxAckDelay */
+  TSCH_IA_SHORT_RX_WAIT, /* RxWait */
+      0, /* AckWait */
+    192, /* RxTx */
+      0, /* MaxAck */
+   4256, /* MaxTx */
+   5000, /* TimeslotLength */
+};
+
 /** @} */

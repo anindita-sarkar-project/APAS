@@ -54,6 +54,12 @@
 #define LINK_OPTION_RX              2
 #define LINK_OPTION_SHARED          4
 #define LINK_OPTION_TIME_KEEPING    8
+/* Implicit-ack overhear link (bit 4, previously reserved): this Rx link's
+ * frames are not addressed to us -- keep HW address filtering disabled for
+ * it and, on a successful receive, offer it to TSCH_CALLBACK_IA_OVERHEAR
+ * instead of the normal "is this frame for me" gate. See
+ * os/services/orchestra/orchestra-rule-implicit-ack.c. */
+#define LINK_OPTION_IA_OVERHEAR     16
 
 /* Default IEEE 802.15.4e hopping sequences, obtained from https://gist.github.com/twatteyne/2e22ee3c1a802b685695 */
 /* 16 channels, sequence length 16 */

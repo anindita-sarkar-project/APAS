@@ -375,6 +375,65 @@
 #define TSCH_LINK_COMPARATOR(a, b) default_tsch_link_comparator(a, b)
 #endif
 
+/******** Configuration: Implicit ACK / autonomous tree scheduling *******/
+
+/* Enables the autonomous, ASFN-rotating tree scheduler with implicit ACKs
+ * (child overhears parent-to-grandparent relay as proof of its own uplink Tx).
+ * See os/services/orchestra/orchestra-rule-implicit-ack.c */
+#ifdef TSCH_CONF_WITH_IMPLICIT_ACK
+#define TSCH_WITH_IMPLICIT_ACK TSCH_CONF_WITH_IMPLICIT_ACK
+#else
+#define TSCH_WITH_IMPLICIT_ACK 0
+#endif
+
+/* Size (in timeslots) of the short, implicit-ack slotframe. This value is
+ * shared between the core ASFN-boundary hook (tsch-schedule.c) and the
+ * Orchestra rule (orchestra-rule-implicit-ack.c) so both always agree on
+ * ASFN = ASN / TSCH_IA_SFS_SIZE. */
+#ifdef TSCH_CONF_IA_SFS_SIZE
+#define TSCH_IA_SFS_SIZE TSCH_CONF_IA_SFS_SIZE
+#else
+#define TSCH_IA_SFS_SIZE 17
+#endif
+
+/* Deadline for an implicit-ack-pending packet, in units of TSCH_IA_SFS_SIZE
+ * ASN ticks (i.e. in short-slotframe cycles): long enough for the parent to
+ * perform its own relay to the grandparent, plus slack for queueing/backoff.
+ * If no matching overheard frame arrives by then, the packet is treated as
+ * MAC_TX_NOACK and handed to the normal retry/drop logic. */
+#ifdef TSCH_CONF_IA_CONFIRMATION_TIMEOUT_CYCLES
+#define TSCH_IA_CONFIRMATION_TIMEOUT_CYCLES TSCH_CONF_IA_CONFIRMATION_TIMEOUT_CYCLES
+#else
+#define TSCH_IA_CONFIRMATION_TIMEOUT_CYCLES 3
+#endif
+
+/* Guard time (RxWait, microseconds) for the short (5ms), implicit-ack-only
+ * timeslot template -- see tsch_timeslot_timing_us_short_5000 in tsch-
+ * timeslot-timing.c. Kept separate from TSCH_CONF_RX_WAIT (the regular
+ * template's own guard time) since the two templates' timing budgets are
+ * independent. */
+#ifdef TSCH_CONF_IA_SHORT_RX_WAIT
+#define TSCH_IA_SHORT_RX_WAIT TSCH_CONF_IA_SHORT_RX_WAIT
+#else
+#define TSCH_IA_SHORT_RX_WAIT 200
+#endif
+
+/* Max number of a sender's own children whose addresses its EB advertises
+ * (MLME_SHORT_IE_TSCH_IA_CHILDREN, frame802154e-ie.c), so the sender's own
+ * parent (this child's grandparent, from the grandchild's point of view)
+ * can learn each grandchild's address and install a matching Rx cell for
+ * its RELAY_TX[grandchild] cell -- otherwise the grandparent has no way to
+ * learn a grandchild's address at all (it never hears the grandchild
+ * directly) and every relayed frame is transmitted into an Rx slot nobody
+ * is listening on. Shared between the framer (IE size) and the Orchestra
+ * rule (list contents), so both agree on the cap; independent of
+ * ORCHESTRA_CONF_IA_MAX_CHILDREN, though sensible to keep them equal. */
+#ifdef TSCH_CONF_IA_IE_MAX_CHILDREN
+#define TSCH_IA_IE_MAX_CHILDREN TSCH_CONF_IA_IE_MAX_CHILDREN
+#else
+#define TSCH_IA_IE_MAX_CHILDREN 4
+#endif
+
 /******** Configuration: CSMA *******/
 
 /* TSCH CSMA-CA parameters, see IEEE 802.15.4e-2012 */

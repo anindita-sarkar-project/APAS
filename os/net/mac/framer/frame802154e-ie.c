@@ -75,6 +75,19 @@ enum ieee802154e_mlme_short_subie_id {
   MLME_SHORT_IE_TSCH_EB_FILTER,
   MLME_SHORT_IE_TSCH_MAC_METRICS_1,
   MLME_SHORT_IE_TSCH_MAC_METRICS_2,
+  /* Non-standard, experimental: carries the sender's own current parent
+   * address, so a receiving child learns its grandparent's address for the
+   * implicit-ack overhear mechanism. Well outside the standard-reserved
+   * 0x1a-0x20 range used above. */
+  MLME_SHORT_IE_TSCH_IA_GRANDPARENT = 0x70,
+  /* Non-standard, experimental: carries the sender's own list of direct
+   * RPL/Orchestra children addresses, so a receiving grandparent (the
+   * sender's own parent) can compute and install a matching Rx cell for
+   * each RELAY_TX[grandchild] cell the sender will use -- otherwise the
+   * grandparent has no way to learn a grandchild's address at all (it never
+   * hears the grandchild directly) and can never listen at the position the
+   * sender's relay actually transmits on. */
+  MLME_SHORT_IE_TSCH_IA_CHILDREN = 0x71,
 };
 
 /* c.f. IEEE 802.15.4e Table 4e */
@@ -341,6 +354,69 @@ frame80215e_create_ie_tsch_channel_hopping_sequence(uint8_t *buf, int len,
   }
 }
 
+#if TSCH_WITH_IMPLICIT_ACK
+/* MLME sub-IE. Non-standard: one byte of the sender's own current queue
+ * depth toward its own parent (ie_ia_parent_congestion -- always present),
+ * plus the sender's own current parent address ("our grandparent" from a
+ * receiving child's point of view) and one byte saying whether that parent
+ * is itself the network root (both only present if the sender has a
+ * parent, e.g. it is not the root) -- see the long comments on
+ * ie_ia_parent_congestion and ie_ia_grandparent_is_root in
+ * frame802154e-ie.h for why these can't just be re-derived locally by the
+ * receiving child. */
+int
+frame80215e_create_ie_tsch_ia_grandparent(uint8_t *buf, int len,
+    const struct ieee802154_ies *ies)
+{
+  int ie_len;
+  if(ies == NULL) {
+    return -1;
+  }
+  ie_len = 1 + (ies->ie_ia_has_grandparent ? (LINKADDR_SIZE + 1) : 0);
+  if(len >= 2 + ie_len) {
+    buf[2] = ies->ie_ia_parent_congestion;
+    if(ies->ie_ia_has_grandparent) {
+      memcpy(buf + 3, ies->ie_ia_grandparent.u8, LINKADDR_SIZE);
+      buf[3 + LINKADDR_SIZE] = ies->ie_ia_grandparent_is_root;
+    }
+    create_mlme_short_ie_descriptor(buf, MLME_SHORT_IE_TSCH_IA_GRANDPARENT, ie_len);
+    return 2 + ie_len;
+  } else {
+    return -1;
+  }
+}
+/* MLME sub-IE. Non-standard: the sender's own direct children's addresses,
+ * so the sender's own parent (this child's grandparent) can install a
+ * matching Rx cell for each grandchild's RELAY_TX cell -- see
+ * MLME_SHORT_IE_TSCH_IA_CHILDREN's comment above. Zero-length if the sender
+ * has no children. */
+int
+frame80215e_create_ie_tsch_ia_children(uint8_t *buf, int len,
+    const struct ieee802154_ies *ies)
+{
+  int ie_len;
+  int i;
+  if(ies == NULL) {
+    return -1;
+  }
+  /* Each child now costs LINKADDR_SIZE + 1 bytes: the address, followed by a
+   * single has-descendants flag byte -- see ie_ia_children_has_descendants's
+   * own comment (frame802154e-ie.h) for why the grandparent needs it. */
+  ie_len = 1 + ies->ie_ia_num_children * (LINKADDR_SIZE + 1);
+  if(len >= 2 + ie_len) {
+    buf[2] = ies->ie_ia_num_children;
+    for(i = 0; i < ies->ie_ia_num_children; i++) {
+      memcpy(buf + 3 + i * (LINKADDR_SIZE + 1), ies->ie_ia_children[i].u8, LINKADDR_SIZE);
+      buf[3 + i * (LINKADDR_SIZE + 1) + LINKADDR_SIZE] = ies->ie_ia_children_has_descendants[i];
+    }
+    create_mlme_short_ie_descriptor(buf, MLME_SHORT_IE_TSCH_IA_CHILDREN, ie_len);
+    return 2 + ie_len;
+  } else {
+    return -1;
+  }
+}
+#endif /* TSCH_WITH_IMPLICIT_ACK */
+
 /* Parse a header IE */
 static int
 frame802154e_parse_header_ie(const uint8_t *buf, int len,
@@ -435,6 +511,35 @@ frame802154e_parse_mlme_short_ie(const uint8_t *buf, int len,
         return len;
       }
       break;
+#if TSCH_WITH_IMPLICIT_ACK
+    case MLME_SHORT_IE_TSCH_IA_GRANDPARENT:
+      if(len == 1 || len == LINKADDR_SIZE + 2) {
+        if(ies != NULL) {
+          ies->ie_ia_parent_congestion = buf[0];
+          ies->ie_ia_has_grandparent = (len == LINKADDR_SIZE + 2);
+          if(ies->ie_ia_has_grandparent) {
+            memcpy(ies->ie_ia_grandparent.u8, buf + 1, LINKADDR_SIZE);
+            ies->ie_ia_grandparent_is_root = buf[1 + LINKADDR_SIZE];
+          }
+        }
+        return len;
+      }
+      break;
+    case MLME_SHORT_IE_TSCH_IA_CHILDREN:
+      if(len >= 1 && len == 1 + buf[0] * (LINKADDR_SIZE + 1)
+         && buf[0] <= TSCH_IA_IE_MAX_CHILDREN) {
+        if(ies != NULL) {
+          int i;
+          ies->ie_ia_num_children = buf[0];
+          for(i = 0; i < ies->ie_ia_num_children; i++) {
+            memcpy(ies->ie_ia_children[i].u8, buf + 1 + i * (LINKADDR_SIZE + 1), LINKADDR_SIZE);
+            ies->ie_ia_children_has_descendants[i] = buf[1 + i * (LINKADDR_SIZE + 1) + LINKADDR_SIZE];
+          }
+        }
+        return len;
+      }
+      break;
+#endif /* TSCH_WITH_IMPLICIT_ACK */
   }
   return -1;
 }
