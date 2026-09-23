@@ -1,38 +1,97 @@
-<img src="https://github.com/contiki-ng/contiki-ng.github.io/blob/master/images/logo/Contiki_logo_2RGB.png" alt="Logo" width="256">
+<img src="https://github.com/contiki-ng/contiki-ng.github.io/blob/master/images/logo/Contiki_logo_2RGB.png" alt="Logo" width="200">
 
-# Contiki-NG: The OS for Next Generation IoT Devices
+# APAS: Autonomous Position-Aware Slot Allocation for 6TiSCH IoT Networks
 
-[![Github Actions](https://github.com/contiki-ng/contiki-ng/workflows/CI/badge.svg?branch=develop)](https://github.com/contiki-ng/contiki-ng/actions)
-[![Documentation Status](https://readthedocs.org/projects/contiki-ng/badge/?version=master)](https://contiki-ng.readthedocs.io/en/master/?badge=master)
-[![license](https://img.shields.io/badge/license-3--clause%20bsd-brightgreen.svg)](https://github.com/contiki-ng/contiki-ng/blob/master/LICENSE.md)
-[![Latest release](https://img.shields.io/github/release/contiki-ng/contiki-ng.svg)](https://github.com/contiki-ng/contiki-ng/releases/latest)
-[![GitHub Release Date](https://img.shields.io/github/release-date/contiki-ng/contiki-ng.svg)](https://github.com/contiki-ng/contiki-ng/releases/latest)
-[![Last commit](https://img.shields.io/github/last-commit/contiki-ng/contiki-ng.svg)](https://github.com/contiki-ng/contiki-ng/commit/HEAD)
+[![license](https://img.shields.io/badge/license-3--clause%20bsd-brightgreen.svg)](LICENSE.md)
+[![Built on Contiki-NG](https://img.shields.io/badge/built%20on-Contiki--NG-blue)](https://github.com/contiki-ng/contiki-ng)
 
-[![Stack Overflow Tag](https://img.shields.io/badge/Stack%20Overflow%20tag-Contiki--NG-blue?logo=stackoverflow)](https://stackoverflow.com/questions/tagged/contiki-ng)
-[![Gitter](https://img.shields.io/badge/Gitter-Contiki--NG-blue?logo=gitter)](https://gitter.im/contiki-ng)
-[![Twitter](https://img.shields.io/badge/Twitter-%40contiki__ng-blue?logo=twitter)](https://twitter.com/contiki_ng)
+This repository contains the reference implementation of **APAS**, an autonomous, position-aware slot allocation scheme for 6TiSCH networks, built on top of [Contiki-NG](https://github.com/contiki-ng/contiki-ng). APAS sizes a node's TSCH cells directly from its position in the RPL topology — its own direct child count and RPL rank — rather than from a fixed rule or from traffic observed after the fact.
 
-Contiki-NG is an open-source, cross-platform operating system for Next-Generation IoT devices. It focuses on dependable (secure and reliable) low-power communication and standard protocols, such as IPv6/6LoWPAN, 6TiSCH, RPL, and CoAP. Contiki-NG comes with extensive documentation, tutorials, a roadmap, release cycle, and well-defined development flow for smooth integration of community contributions.
+> Anindita Sarkar and Alakesh Kalita, *"Autonomous Position-Aware Slot Allocation for 6TiSCH IoT Networks,"* submitted to **IEEE Internet of Things Journal**.
 
-Unless explicitly stated otherwise, Contiki-NG sources are distributed under
-the terms of the [3-clause BSD license](LICENSE.md). This license gives
-everyone the right to use and distribute the code, either in binary or
-source code format, as long as the copyright license is retained in
-the source code.
+## Why APAS
 
-Contiki-NG started as a fork of the Contiki OS and retains some of its original features.
+Existing autonomous 6TiSCH schedulers fall into two camps: fixed allocators (Orchestra's ORB/OSB, ALICE) that never adapt to traffic, and traffic-adaptive allocators (A³) that only grow a node's capacity *after* enough traffic has already built up — a signaling-lag defect that gets worse as networks scale and traffic converges toward the root. Every node in a 6TiSCH network already knows its own RPL rank and its own direct child count locally, at no extra signaling cost, the moment it joins the network — before any of its traffic exists to be observed. APAS uses exactly that.
 
-Find out more:
+APAS combines four mechanisms:
 
-* GitHub repository: https://github.com/contiki-ng/contiki-ng
-* Documentation: https://docs.contiki-ng.org/
-* List of releases and changes: https://github.com/contiki-ng/contiki-ng/releases
-* Web site: http://contiki-ng.org
+| Mechanism | What it does |
+|---|---|
+| **Structural floor** (`K_S = min(m_S + 1, K_max)`) | Grants a node cells the instant a child joins, sized by its direct child count, before that child ever transmits. |
+| **Asymmetric load estimation** | Lets a genuinely busy node earn one extra cell from its own recent traffic, using a fast-rise/slow-fall EWMA so a single busy window doesn't cost a still-needed cell later. |
+| **Idle reclaim** | Shrinks a child's cells back to its guaranteed minimum after sustained silence, freeing capacity for other nodes without waiting for RPL to remove it. |
+| **Rank-aware cap** | Gives nodes near the border router (BR) a larger cap (`K_max = 6` vs. `4`), since their traffic converges from many subtrees at once. |
 
-Engage with the community:
+## Repository layout
 
-* Discussions on GitHub: https://github.com/contiki-ng/contiki-ng/discussions
-* Contiki-NG tag on Stack Overflow: https://stackoverflow.com/questions/tagged/contiki-ng
-* Gitter: https://gitter.im/contiki-ng
-* Twitter: https://twitter.com/contiki_ng
+This is a full Contiki-NG checkout; the APAS-specific additions are:
+
+```
+os/services/orchestra/orchestra-rule-child-grandchild.c   # the APAS mechanism itself (an Orchestra rule)
+examples/6tisch/
+├── child-grandchild-tree/           # base example, all 4 mechanisms configurable via project-conf.h
+├── child-grandchild-tree-pa3/       # isolated copy used for the paper's main Cooja evaluation (Figs. 5-7)
+├── child-grandchild-tree-enhanced/  # ablation variant
+├── child-grandchild-tree-vanilla/   # ablation variant
+├── apas-iotlab-m3/                  # real FIT IoT-LAB deployment, 60 nodes (Grenoble, m3 boards)
+├── apas-iotlab-m3-150node/          # real FIT IoT-LAB deployment, 150 nodes (Grenoble, m3 boards)
+├── run_pa3_prelim.sh                # sweep script: slotframe x traffic-rate x node-count, matching the baseline sweep grid
+└── parse_table2.py                  # parses COOJA.testlog output into PDR/RDC/latency/throughput/parent-change tables
+```
+
+Everything else in the tree is unmodified upstream Contiki-NG.
+
+## Building and running (Cooja simulation)
+
+The slotframe/traffic-rate/node-count sweep reported in the paper (Figs. 5-7) is run in the Cooja simulator, which lets us evaluate network sizes beyond what a physical testbed allocation supports:
+
+```bash
+cd examples/6tisch
+./run_pa3_prelim.sh                                    # full grid (5 rates x 5 slotframes x 6 node counts)
+RATE_LIST="4" SF_LIST="67" NODES="60" ./run_pa3_prelim.sh   # a single configuration
+python3 parse_table2.py pa3_prelim_results/*/*/*       # parse results into PDR/RDC/latency/throughput
+```
+
+Baselines (ORB, OSB, ALICE, A³) are reimplemented independently and swept the same way — see `run_prelim_sweep.sh` in the companion baseline repository referenced in the paper.
+
+## Real hardware deployment (FIT IoT-LAB)
+
+APAS is also validated on real hardware: FIT IoT-LAB, Grenoble site, m3 boards (STM32F103RE + AT86RF231), 4-channel hopping ({15, 20, 25, 26}), −17 dBm TX power. Build for the `iotlab` target with the ARM GCC 10.3-2021.10 toolchain (pinned in `tools/docker/Dockerfile`):
+
+```bash
+cd examples/6tisch/apas-iotlab-m3       # or apas-iotlab-m3-150node for the 150-node deployment
+make TARGET=iotlab BOARD=m3
+iotlab-experiment submit -n apas-node -d <duration> -l grenoble,m3,<node-range>,build/iotlab/m3/node.iotlab
+iotlab-node -i <experiment-id> --flash build/iotlab/m3/node.iotlab -l grenoble,m3,<node-range>
+```
+
+Each node's real MAC address is mapped to a logical id (1 = root) via `deployment-map.c` and the `services/deployment` module — a node prints its own MAC and role over serial on boot and every 30 seconds thereafter, which is how `deployment-map.c` is populated with real hardware addresses.
+
+## Comparison with existing schedulers
+
+APAS is compared against ORB, OSB, ALICE, and A³ — see the paper for the full slotframe-length, traffic-rate, and node-count sweep. Averaged across all three sweep dimensions, APAS improves packet delivery ratio by 54.3%, reduces radio duty cycle and end-to-end latency by 43.9% and 67.4% respectively, and improves throughput by 70.8%, compared to the baseline average.
+
+## Citation
+
+```bibtex
+@article{sarkar2026apas,
+  title   = {Autonomous Position-Aware Slot Allocation for 6TiSCH IoT Networks},
+  author  = {Sarkar, Anindita and Kalita, Alakesh},
+  journal = {IEEE Internet of Things Journal},
+  note    = {Submitted},
+  year    = {2026}
+}
+```
+
+## Contact
+
+Anindita Sarkar (26dr0006@iitism.ac.in), Alakesh Kalita (alakesh.kalita1025@gmail.com) — Department of Mathematics and Computing, Indian Institute of Technology (ISM) Dhanbad.
+
+---
+
+## About Contiki-NG
+
+This repository is built on [Contiki-NG](https://github.com/contiki-ng/contiki-ng), an open-source, cross-platform operating system for Next-Generation IoT devices, focused on dependable low-power communication and standard protocols (IPv6/6LoWPAN, 6TiSCH, RPL, CoAP). Unless explicitly stated otherwise, sources in this repository are distributed under the terms of the [3-clause BSD license](LICENSE.md).
+
+* Upstream repository: https://github.com/contiki-ng/contiki-ng
+* Upstream documentation: https://docs.contiki-ng.org/
