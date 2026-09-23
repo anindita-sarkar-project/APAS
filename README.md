@@ -27,32 +27,14 @@ APAS combines four mechanisms:
 This is a full Contiki-NG checkout; the APAS-specific additions are:
 
 ```
-os/services/orchestra/orchestra-rule-child-grandchild.c   # the APAS mechanism itself (an Orchestra rule)
+In OS folder  # the APAS mechanism
 examples/6tisch/
 ├── child-grandchild-tree/           # base example, all 4 mechanisms configurable via project-conf.h
-├── child-grandchild-tree-pa3/       # isolated copy used for the paper's main Cooja evaluation (Figs. 5-7)
-├── child-grandchild-tree-enhanced/  # ablation variant
-├── child-grandchild-tree-vanilla/   # ablation variant
 ├── apas-iotlab-m3/                  # real FIT IoT-LAB deployment, 60 nodes (Grenoble, m3 boards)
-├── apas-iotlab-m3-150node/          # real FIT IoT-LAB deployment, 150 nodes (Grenoble, m3 boards)
-├── run_pa3_prelim.sh                # sweep script: slotframe x traffic-rate x node-count, matching the baseline sweep grid
-└── parse_table2.py                  # parses COOJA.testlog output into PDR/RDC/latency/throughput/parent-change tables
 ```
 
-Everything else in the tree is unmodified upstream Contiki-NG.
 
-## Building and running (Cooja simulation)
 
-The slotframe/traffic-rate/node-count sweep reported in the paper (Figs. 5-7) is run in the Cooja simulator, which lets us evaluate network sizes beyond what a physical testbed allocation supports:
-
-```bash
-cd examples/6tisch
-./run_pa3_prelim.sh                                    # full grid (5 rates x 5 slotframes x 6 node counts)
-RATE_LIST="4" SF_LIST="67" NODES="60" ./run_pa3_prelim.sh   # a single configuration
-python3 parse_table2.py pa3_prelim_results/*/*/*       # parse results into PDR/RDC/latency/throughput
-```
-
-Baselines (ORB, OSB, ALICE, A³) are reimplemented independently and swept the same way — see `run_prelim_sweep.sh` in the companion baseline repository referenced in the paper.
 
 ## Real hardware deployment (FIT IoT-LAB)
 
@@ -71,23 +53,6 @@ Each node's real MAC address is mapped to a logical id (1 = root) via `deploymen
 
 APAS is compared against ORB, OSB, ALICE, and A³ — see the paper for the full slotframe-length, traffic-rate, and node-count sweep. Averaged across all three sweep dimensions, APAS improves packet delivery ratio by 54.3%, reduces radio duty cycle and end-to-end latency by 43.9% and 67.4% respectively, and improves throughput by 70.8%, compared to the baseline average.
 
-## Citation
-
-```bibtex
-@article{sarkar2026apas,
-  title   = {Autonomous Position-Aware Slot Allocation for 6TiSCH IoT Networks},
-  author  = {Sarkar, Anindita and Kalita, Alakesh},
-  journal = {IEEE Internet of Things Journal},
-  note    = {Submitted},
-  year    = {2026}
-}
-```
-
-## Contact
-
-Anindita Sarkar (26dr0006@iitism.ac.in), Alakesh Kalita (alakesh.kalita1025@gmail.com) — Department of Mathematics and Computing, Indian Institute of Technology (ISM) Dhanbad.
-
----
 
 ## About Contiki-NG
 
